@@ -1,0 +1,9 @@
+cav_env/
+*.7z
+*.pyc
+__pycache__/
+.DS_Store
+.vscode/
+*.egg-info/
+dist/
+build/
