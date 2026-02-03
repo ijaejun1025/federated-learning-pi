@@ -10,3 +10,4 @@ build/
 *.csv
 *.npz
 *.ipynb
+**/normal_run_data.txt
