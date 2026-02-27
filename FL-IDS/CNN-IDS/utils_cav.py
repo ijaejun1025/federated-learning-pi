@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 import matplotlib.pyplot as plt
+from numpy import NaN
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -18,9 +19,14 @@ import pandas as pd
 from sklearn import preprocessing
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from typing import Tuple
+
+# Type definitions
+XY = Tuple[np.ndarray, np.ndarray]
+Dataset = Tuple[XY, XY]
 
 # loading the dataset
-path = "FL-IDS/CNN-IDS/cav/"
+path = "cav/"
 files = [file for file in glob.glob(path + "**/*.csv", recursive=True)]
 
 # Reading all the csv files into dataframes and putting thoose DFs to one list.
@@ -34,10 +40,10 @@ def changecolumn(dataset, AttackType):
     return df
 
 
-dfDos = changecolumn('FL-IDS/CNN-IDS/cav/DoS_dataset.csv','DoS')
-dfFuzzy = changecolumn('FL-IDS/CNN-IDS/cav/Fuzzy_dataset.csv','Fuzzy')
-dfGear = changecolumn('FL-IDS/CNN-IDS/cav/gear_dataset.csv','Gear-Spooing')
-dfRPM = changecolumn('FL-IDS/CNN-IDS/cav/RPM_dataset.csv','RPM-Spoofing')
+dfDos = changecolumn('cav/DoS_dataset.csv','DoS')
+dfFuzzy = changecolumn('cav/Fuzzy_dataset.csv','Fuzzy')
+dfGear = changecolumn('cav/gear_dataset.csv','Gear-Spooing')
+dfRPM = changecolumn('cav/RPM_dataset.csv','RPM-Spoofing')
 frames = [dfDos, dfFuzzy, dfGear, dfRPM]
 df = pd.concat(frames)
 #print(df.head(10))
@@ -95,21 +101,30 @@ bin_data.to_csv("cav_anoamly.csv")
 # In[4]:
 
 
-def load_cav():
-    
+def load_cav() -> Dataset:
+
     data = pd.read_csv('cav_anoamly.csv')
     data.reset_index(drop=True)
-    numeric_cols = data.select_dtypes(include='number').columns
-    X = data[numeric_cols].values
-    y = data['AttackType'].values
+
+    # Select only numeric columns (skip index column 0, Timestamp column 1)
+    # Use columns 2-11 (CAN ID, Byte, DATA[0-7]) as features
+    # Column 12 (intrusion) as target
+    df = np.array(data)
+    X = df[:,2:12]  # Changed from 1:11 to 2:12 to skip Timestamp
+    y = df[:,12]    # intrusion column
 
     # Standardizing the features
     x = StandardScaler().fit_transform(X)
     # Label encoding
     label_encoder = preprocessing.LabelEncoder()
     y = label_encoder.fit_transform(y)
-   
+
    # """ Select the 80% of the data as Training data and 20% as test data """
     x_train,x_test,y_train,y_test= train_test_split(x,y, test_size=0.33, random_state=41, shuffle=True, stratify=y)
+
+    # Reshape for CNN input (samples, features, channels)
+    x_train = x_train.reshape(x_train.shape[0], x_train.shape[1], 1)
+    x_test = x_test.reshape(x_test.shape[0], x_test.shape[1], 1)
+
     return (x_train, y_train), (x_test, y_test)
 

@@ -1,139 +1,185 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
-
-
-from types import new_class
 from typing import Tuple, Union, List
+import datetime
+import glob
+import os
+import shutil
+import urllib.request
+import zipfile
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 import pandas as pd
 from sklearn import preprocessing
 from sklearn.preprocessing import StandardScaler
-import openml
 from sklearn.model_selection import train_test_split
-
-
-# In[2]:
-
 
 XY = Tuple[np.ndarray, np.ndarray]
 Dataset = Tuple[XY, XY]
 LogRegParams = Union[XY, Tuple[np.ndarray]]
 XYList = List[XY]
 
-# loading the dataset
-path = "cav/"
-files = [file for file in glob.glob(path + "**/*.csv", recursive=True)]
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CAV_DIR = os.path.join(BASE_DIR, "cav")
+ANOMALY_CSV_PATH = os.path.join(BASE_DIR, "cav_anoamly.csv")
+DROPBOX_CAV_ZIP_URL = (
+    "https://www.dropbox.com/scl/fo/9rwsf9pclhvv9xxloojom/AF7JeRW893grZkigkulkAHk"
+    "?rlkey=3h6zamu3kc262lrnipu5qden8&dl=1"
+)
+REQUIRED_CAV_FILES = [
+    "DoS_dataset.csv",
+    "Fuzzy_dataset.csv",
+    "gear_dataset.csv",
+    "RPM_dataset.csv",
+]
 
-# Reading all the csv files into dataframes and putting thoose DFs to one list.
 
-dataset = [pd.read_csv(f) for f in files]
-def changecolumn(dataset, AttackType):
-    df = pd.read_csv(dataset).sample(frac = 0.1, random_state = 20, replace = False).reset_index(drop=True)
-    df.columns = ["Timestamp", "CAN ID", "Byte", "DATA[0]","DATA[1]","DATA[2]","DATA[3]","DATA[4]","DATA[5]","DATA[6]","DATA[7]","AttackType"]
-    df['AttackType'] = np.where(df['AttackType'] == 'T',AttackType, 'Normal')
-    df.dropna()
+def _find_file_recursively(root_dir: str, file_name: str):
+    matches = glob.glob(os.path.join(root_dir, "**", file_name), recursive=True)
+    return matches[0] if matches else None
+
+
+def _download_and_extract_cav_dataset() -> None:
+    os.makedirs(CAV_DIR, exist_ok=True)
+    zip_path = os.path.join(BASE_DIR, "cav_dataset_download.zip")
+
+    urllib.request.urlretrieve(DROPBOX_CAV_ZIP_URL, zip_path)
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(CAV_DIR)
+
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+
+    for file_name in REQUIRED_CAV_FILES:
+        target_path = os.path.join(CAV_DIR, file_name)
+        if not os.path.exists(target_path):
+            located = _find_file_recursively(CAV_DIR, file_name)
+            if located:
+                shutil.copy2(located, target_path)
+
+
+def _ensure_raw_cav_files() -> None:
+    missing = [
+        file_name
+        for file_name in REQUIRED_CAV_FILES
+        if not os.path.exists(os.path.join(CAV_DIR, file_name))
+    ]
+    if not missing:
+        return
+
+    try:
+        _download_and_extract_cav_dataset()
+    except Exception as error:
+        raise FileNotFoundError(
+            "CAV raw CSV files were not found, and automatic download also failed. "
+            f"Required files: {REQUIRED_CAV_FILES}, error: {error}"
+        ) from error
+
+    still_missing = [
+        file_name
+        for file_name in REQUIRED_CAV_FILES
+        if not os.path.exists(os.path.join(CAV_DIR, file_name))
+    ]
+    if still_missing:
+        raise FileNotFoundError(
+            "Some files are still missing after automatic download: "
+            f"{still_missing}. Please place them manually under {CAV_DIR}."
+        )
+
+
+def changecolumn(file_path, AttackType):
+    df = pd.read_csv(file_path).sample(frac=0.1, random_state=20, replace=False).reset_index(drop=True)
+    df.columns = ["Timestamp", "CAN ID", "Byte", "DATA[0]", "DATA[1]", "DATA[2]", "DATA[3]",
+                  "DATA[4]", "DATA[5]", "DATA[6]", "DATA[7]", "AttackType"]
+    df['AttackType'] = np.where(df['AttackType'] == 'T', AttackType, 'Normal')
+    df = df.dropna()
     return df
 
 
-dfDos = changecolumn('cav/DoS_dataset.csv','DoS')
-dfFuzzy = changecolumn('cav/Fuzzy_dataset.csv','Fuzzy')
-dfGear = changecolumn('cav/gear_dataset.csv','Gear-Spooing')
-dfRPM = changecolumn('cav/RPM_dataset.csv','RPM-Spoofing')
-frames = [dfDos, dfFuzzy, dfGear, dfRPM]
-df = pd.concat(frames)
-#print(df.head(10))
-#print(df.shape)
-
-# dataset shape
-
-dataset = df.dropna()
-print('shape of the data',dataset.shape)
-print(dataset['AttackType'].value_counts())
-
 def changecolumntype(df):
-    for column in df[['CAN ID', 'DATA[0]', 'DATA[1]', 'DATA[2]', 'DATA[3]', 'DATA[4]', 'DATA[5]', 'DATA[6]', 'DATA[7]']]:
+    for column in df[['CAN ID', 'DATA[0]', 'DATA[1]', 'DATA[2]', 'DATA[3]',
+                       'DATA[4]', 'DATA[5]', 'DATA[6]', 'DATA[7]']]:
         df[column] = df[column].apply(lambda x: int(str(x), base=16))
     return df
 
-dataset = changecolumntype(dataset)
-#print(dataset.dtypes)
+def _build_cav_anomaly_csv() -> None:
+    _ensure_raw_cav_files()
 
-import datetime
-newdf = dataset.copy(deep = True)
-dateformat = "%Y-%m-%d %H:%M:%S.%f"
-dataset['Timestamp'] = dataset['Timestamp'].apply(lambda x: datetime.datetime.fromtimestamp(float(x)).strftime(dateformat))
-#print(dataset.dtypes)
-#dataset.head(10)
-# In[3]:
+    dfDos = changecolumn(os.path.join(CAV_DIR, 'DoS_dataset.csv'), 'DoS')
+    dfFuzzy = changecolumn(os.path.join(CAV_DIR, 'Fuzzy_dataset.csv'), 'Fuzzy')
+    dfGear = changecolumn(os.path.join(CAV_DIR, 'gear_dataset.csv'), 'Gear-Spooing')
+    dfRPM = changecolumn(os.path.join(CAV_DIR, 'RPM_dataset.csv'), 'RPM-Spoofing')
+    frames = [dfDos, dfFuzzy, dfGear, dfRPM]
+    df = pd.concat(frames)
 
-bin_label = pd.DataFrame(dataset.AttackType.map(lambda x:'Normal' if x=='Normal' else 'ATTACK'))
-bin_data = dataset.copy()
-bin_data['AttackType'] = bin_label
-from sklearn.preprocessing import LabelEncoder
+    dataset = df.dropna()
+    dataset = changecolumntype(dataset)
 
-LE1 = LabelEncoder()
+    dateformat = "%Y-%m-%d %H:%M:%S.%f"
+    dataset['Timestamp'] = dataset['Timestamp'].apply(
+        lambda x: datetime.datetime.fromtimestamp(float(x)).strftime(dateformat)
+    )
 
-enc_label = bin_label.apply(LE1.fit_transform)
-bin_data['intrusion']= enc_label
+    bin_label = pd.DataFrame(dataset.AttackType.map(lambda x: 'Normal' if x == 'Normal' else 'ATTACK'))
+    bin_data = dataset.copy()
+    bin_data['AttackType'] = bin_label
 
-# one-hot-encoding for attack label
+    le1 = preprocessing.LabelEncoder()
+    enc_label = bin_label.apply(le1.fit_transform)
+    bin_data['intrusion'] = enc_label
 
-bin_data = pd.get_dummies(bin_data,columns=['AttackType'],prefix="",prefix_sep="")
-bin_data['AttackType']= bin_label
-
-# creating dataframe with only numeric attributes of binary class and encoded label attribute
-numeric_col = dataset.select_dtypes(include = 'number').columns
-
-numeric_bin = bin_data[numeric_col]
-numeric_bin['intrusion'] = bin_data['intrusion']
-
-bin_data['AttackType'].value_counts()
-
-
-# In[3]:
-
-
-bin_data.to_csv("cav_anoamly.csv")
-
-
-# In[ ]:
+    bin_data = pd.get_dummies(bin_data, columns=['AttackType'], prefix="", prefix_sep="")
+    bin_data['AttackType'] = bin_label
+    bin_data.to_csv(ANOMALY_CSV_PATH, index=False)
 
 
 def load_cav() -> Dataset:
-    
-    data = pd.read_csv('cav_anoamly.csv')
-    data.reset_index(drop=True)
-    df =np.array(data)
-    X = df.iloc[:,1:11]
-    y = df.iloc[:,-1]
+    if not os.path.exists(ANOMALY_CSV_PATH):
+        _build_cav_anomaly_csv()
 
-    # Standardizing the features
+    data = pd.read_csv(ANOMALY_CSV_PATH)
+    data = data.reset_index(drop=True)
+
+    X = data.iloc[:, 2:12]
+    y = data['intrusion']
+
     x = StandardScaler().fit_transform(X)
-    # Label encoding
     label_encoder = preprocessing.LabelEncoder()
     y = label_encoder.fit_transform(y)
-   
-   # """ Select the 80% of the data as Training data and 20% as test data """
-    x_train,x_test,y_train,y_test= train_test_split(x,y, test_size=0.33, random_state=41, shuffle=True, stratify=y)
+
+    x_train, x_test, y_train, y_test = train_test_split(
+        x, y, test_size=0.33, random_state=41, shuffle=True, stratify=y
+    )
     return (x_train, y_train), (x_test, y_test)
 
 
-# In[5]:
-
-
 def shuffle(X: np.ndarray, y: np.ndarray) -> XY:
-    """Shuffle X and y."""
     rng = np.random.default_rng()
     idx = rng.permutation(len(X))
     return X[idx], y[idx]
 
-
 def partition(X: np.ndarray, y: np.ndarray, num_partitions: int) -> XYList:
-    """Split X and y into a number of partitions."""
-    return list(
-        zip(np.array_split(X, num_partitions), np.array_split(y, num_partitions))
-    )
+    return list(zip(np.array_split(X, num_partitions), np.array_split(y, num_partitions)))
+
+def get_model_parameters(model: LogisticRegression) -> LogRegParams:
+    if model.fit_intercept:
+        params = [model.coef_, model.intercept_]
+    else:
+        params = [model.coef_]
+    return params
+
+def set_model_params(model: LogisticRegression, params: LogRegParams) -> LogisticRegression:
+    model.coef_ = params[0]
+    if model.fit_intercept:
+        model.intercept_ = params[1]
+    return model
+
+def set_initial_params(model: LogisticRegression):
+    n_classes = 2
+    n_features = 10
+    model.classes_ = np.array([i for i in range(2)])
+    model.coef_ = np.zeros((n_classes, n_features))
+    if model.fit_intercept:
+        model.intercept_ = np.zeros((n_classes,))
 

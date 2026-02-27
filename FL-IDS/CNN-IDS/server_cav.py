@@ -18,13 +18,18 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         return aggregated_weights
 
 # Create strategy and run server
-strategy = SaveModelStrategy()
+strategy = SaveModelStrategy(
+    min_fit_clients=6,        # Minimum number of clients for training
+    min_evaluate_clients=6,   # Minimum number of clients for evaluation
+    min_available_clients=6,  # Minimum number of clients that must connect
+)
 
 # Start Flower server for three rounds of federated learning with 1Gb of data
 # Start Flower server
 fl.server.start_server(
     server_address="0.0.0.0:3040",
     config=fl.server.ServerConfig(num_rounds=3),
+    strategy=strategy,
 )
 
 

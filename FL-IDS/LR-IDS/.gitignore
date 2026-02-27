@@ -1,0 +1,23 @@
+# Virtual Environment
+fl_env/
+venv/
+env/
+*.pyc
+__pycache__/
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Large dataset files (too big for GitHub - share separately)
+cav_anoamly.csv
+cav/DoS_dataset.csv
+cav/Fuzzy_dataset.csv
+cav/gear_dataset.csv
+cav/RPM_dataset.csv
+prediction_results.csv
+
