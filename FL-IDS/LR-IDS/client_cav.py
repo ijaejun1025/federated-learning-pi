@@ -13,9 +13,19 @@ import matplotlib.pyplot as plt
 import numpy as np
 import utils_cav
 from sklearn.metrics import f1_score, precision_score, recall_score, average_precision_score
+from sklearn.model_selection import train_test_split
 #tf.config.set_visible_devices([], 'CPU')
 # Load dataset
-(x_train, y_train), (x_test, y_test) = utils_cav.load_cav()
+TEST_SIZE = 0.33
+
+x, y = utils_cav.load_cav()
+x_train, x_test, y_train, y_test = train_test_split(
+    x,
+    y,
+    test_size=TEST_SIZE,
+    shuffle=True,
+    stratify=y,
+)
 
 # Conv2D expects 4D input: (samples, height, width, channels)
 # Here we treat feature vector as height and use width=1, channels=1

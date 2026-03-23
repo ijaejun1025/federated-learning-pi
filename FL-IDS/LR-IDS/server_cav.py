@@ -8,9 +8,11 @@ import pandas as pd
 import utils_cav
 import tensorflow as tf
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import train_test_split
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROUND_METRICS_CSV = os.path.join(BASE_DIR, "round_metrics.csv")
+TEST_SIZE = 0.33
 
 
 def build_model(input_shape):
@@ -97,7 +99,15 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         return aggregated_weights
 
 # Load data for server-side evaluation
-(_, _), (x_test, y_test) = utils_cav.load_cav()
+x, y = utils_cav.load_cav()
+_, x_test, _, y_test = train_test_split(
+    x,
+    y,
+    test_size=TEST_SIZE,
+    random_state=41,
+    shuffle=True,
+    stratify=y,
+)
 if x_test.ndim == 2:
     x_test = x_test[:, :, np.newaxis, np.newaxis]
 

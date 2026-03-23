@@ -11,7 +11,6 @@ import zipfile
 import numpy as np
 import pandas as pd
 from sklearn import preprocessing
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -153,8 +152,4 @@ def load_cav():
     x = StandardScaler().fit_transform(X)
     label_encoder = preprocessing.LabelEncoder()
     y = label_encoder.fit_transform(y)
-
-    x_train, x_test, y_train, y_test = train_test_split(
-        x, y, test_size=0.33, random_state=41, shuffle=True, stratify=y
-    )
-    return (x_train, y_train), (x_test, y_test)
+    return x, y
