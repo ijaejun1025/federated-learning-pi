@@ -7,7 +7,8 @@ import os
 import pandas as pd
 import utils_cav
 import tensorflow as tf
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from flwr.common import parameters_to_ndarrays
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 from sklearn.model_selection import train_test_split
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +35,8 @@ def build_model(input_shape):
 
 
 def get_evaluate_fn(model, x_test, y_test):
+    labels = np.unique(y_test)
+
     def evaluate(server_round, parameters, config):
         model.set_weights(parameters)
         loss, _ = model.evaluate(x_test, y_test, verbose=0)
@@ -41,16 +44,17 @@ def get_evaluate_fn(model, x_test, y_test):
         y_pred_proba = model.predict(x_test, verbose=0)
         y_pred = y_pred_proba.argmax(axis=1)
 
-        prediction_results = pd.DataFrame(y_pred_proba, columns=["prob_class_0", "prob_class_1"])
-        prediction_results["y_true"] = y_test
-        prediction_results["y_pred"] = y_pred
-        prediction_results_csv = os.path.join(BASE_DIR, f"prediction_results_round_{server_round}.csv")
-        prediction_results.to_csv(prediction_results_csv, index=False)
-
         accuracy = accuracy_score(y_test, y_pred)
         precision = precision_score(y_test, y_pred, average="weighted", zero_division=0)
         recall = recall_score(y_test, y_pred, average="weighted", zero_division=0)
         f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+        cm = confusion_matrix(y_test, y_pred, labels=labels)
+
+        cm_df = pd.DataFrame(cm, index=[f"true_{label}" for label in labels], columns=[f"pred_{label}" for label in labels])
+        cm_csv = os.path.join(BASE_DIR, f"confusion_matrix_round_{server_round}.csv")
+        cm_df.to_csv(cm_csv, index=True)
+        print(f"Round {server_round} confusion matrix:")
+        print(cm_df.to_string())
 
         metrics_row = pd.DataFrame(
             [
@@ -64,11 +68,10 @@ def get_evaluate_fn(model, x_test, y_test):
                 }
             ]
         )
-        round_metrics_csv = os.path.join(BASE_DIR, f"round_metrics_round_{server_round}.csv")
         metrics_row.to_csv(
-            round_metrics_csv,
-            mode="w",
-            header=True,
+            ROUND_METRICS_CSV,
+            mode="a",
+            header=not os.path.exists(ROUND_METRICS_CSV),
             index=False,
         )
 
@@ -87,16 +90,22 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         super().__init__(evaluate_fn=evaluate_fn)
         self.weights_dir = "weights"
         os.makedirs(self.weights_dir, exist_ok=True)
-    
-    def aggregate_fit(self,rnd,results,failures):
-        aggregated_weights = super().aggregate_fit(rnd, results, failures)
-        if aggregated_weights is not None:
-            # Save aggregated_weights
-            print(f"Saving round {rnd} aggregated_weights...")
-            save_path = os.path.join(self.weights_dir, f"round-{rnd}-weights.npz")
-            np.savez(save_path, *aggregated_weights)
+        self.best_loss = float("inf")
+
+    def evaluate(self, server_round, parameters):
+        evaluate_result = super().evaluate(server_round, parameters)
+        if evaluate_result is None:
+            return None
+
+        loss, metrics = evaluate_result
+        if loss < self.best_loss:
+            self.best_loss = loss
+            print(f"Saving best aggregated_weights at round {server_round} (loss={loss:.6f})...")
+            save_path = os.path.join(self.weights_dir, "best-weights.npz")
+            np.savez(save_path, *parameters_to_ndarrays(parameters))
             print(f"Saved to: {save_path}")
-        return aggregated_weights
+
+        return loss, metrics
 
 # Load data for server-side evaluation
 x, y = utils_cav.load_cav()
