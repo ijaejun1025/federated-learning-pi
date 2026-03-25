@@ -1,99 +1,105 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
-
+import argparse
 
 import flwr as fl
+import numpy as np
 import tensorflow as tf
 from tensorflow import keras
-import sys
-import seaborn as sns
-import matplotlib.pyplot as plt
-import numpy as np
-import utils_cav
-from sklearn.metrics import f1_score, precision_score, recall_score, average_precision_score
-from sklearn.model_selection import train_test_split
-#tf.config.set_visible_devices([], 'CPU')
-# Load dataset
-TEST_SIZE = 0.33
+from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score
 
-x, y = utils_cav.load_cav()
-x_train, x_test, y_train, y_test = train_test_split(
-    x,
-    y,
+import utils_cav
+
+TEST_SIZE = 0.33
+RANDOM_STATE = 41
+NUM_CLIENTS = 6
+LOCAL_VAL_SIZE = 0.2
+
+
+def build_model(input_shape):
+    model = keras.Sequential([
+        keras.layers.Input(shape=input_shape),
+        keras.layers.Conv2D(96, (4, 4), activation="relu", padding="same"),
+        keras.layers.Conv2D(64, (3, 3), activation="relu", padding="same"),
+        keras.layers.Conv2D(32, (2, 2), activation="relu", padding="same"),
+        keras.layers.Dropout(0.5),
+        keras.layers.Flatten(),
+        keras.layers.Dense(512, activation="relu"),
+        keras.layers.Dense(128, activation="relu"),
+        keras.layers.Dense(32, activation="relu"),
+        keras.layers.Dense(2, activation="softmax"),
+    ])
+    model.compile("adam", "sparse_categorical_crossentropy", metrics=["sparse_categorical_accuracy"])
+    return model
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--client-id", type=int, default=0, help="Zero-based client index")
+parser.add_argument("--num-clients", type=int, default=NUM_CLIENTS, help="Total number of clients")
+parser.add_argument("--server-address", type=str, default="192.168.137.68:3040")
+args = parser.parse_args()
+
+x_train, x_val, y_train, y_val = utils_cav.get_client_partition(
+    client_id=args.client_id,
+    num_clients=args.num_clients,
     test_size=TEST_SIZE,
-    shuffle=True,
-    stratify=y,
+    random_state=RANDOM_STATE,
+    local_val_size=LOCAL_VAL_SIZE,
 )
 
-# Conv2D expects 4D input: (samples, height, width, channels)
-# Here we treat feature vector as height and use width=1, channels=1
-if x_train.ndim == 2:
-    x_train = x_train[:, :, np.newaxis, np.newaxis]
-    x_test = x_test[:, :, np.newaxis, np.newaxis]
+x_train = utils_cav.reshape_for_cnn(x_train)
+x_val = utils_cav.reshape_for_cnn(x_val)
 
-
-# Load model and data (MobileNetV2, CIFAR-10)
-model = keras.Sequential([
-    keras.layers.Conv2D(96,(4,4),input_shape=(x_train.shape[1],x_train.shape[2],x_train.shape[3]),activation='relu',padding='same'),
-    keras.layers.Conv2D(64,(3,3),activation="relu",padding='same'),
-    keras.layers.Conv2D(32,(2,2),activation="relu",padding='same'),
-    keras.layers.Dropout(0.5),
-    keras.layers.Flatten(),
-    keras.layers.Dense(512,activation="relu"),
-    keras.layers.Dense(128,activation="relu"),
-    keras.layers.Dense(32,activation="relu"),
-    keras.layers.Dense(2,activation="softmax"),
-    
-    
-    
-    ])
-
-model.compile("adam", "sparse_categorical_crossentropy", metrics=["sparse_categorical_accuracy"])
+model = build_model((x_train.shape[1], x_train.shape[2], x_train.shape[3]))
 model.summary()
 
 
-# Define Flower client
 class FlowerClient(fl.client.NumPyClient):
     def get_parameters(self, config):
         return model.get_weights()
 
     def fit(self, parameters, config):
         model.set_weights(parameters)
-        r = model.fit(x_train, y_train, epochs=3, validation_data=(x_test, y_test))
-        hist = r.history
-        print("Fit history : " ,hist)
+        history = model.fit(
+            x_train,
+            y_train,
+            epochs=3,
+            validation_data=(x_val, y_val),
+            verbose=1,
+        )
+        print("Fit history:", history.history)
         return model.get_weights(), len(x_train), {}
 
     def evaluate(self, parameters, config):
         model.set_weights(parameters)
-        loss, accuracy = model.evaluate(x_test, y_test, verbose=0)
-        
-        # Predictions
-        y_pred = model.predict(x_test).argmax(axis=1)
-        
-        # Metrics calculation
-        f1 = f1_score(y_test, y_pred, average='weighted')
-        precision = precision_score(y_test, y_pred, average='weighted')
-        recall = recall_score(y_test, y_pred, average='weighted')
-        
-        # MAP (Mean Average Precision) calculation
-        y_pred_proba = model.predict(x_test)
-        map_score = average_precision_score(y_test, y_pred_proba[:, 1])
-        
-        print(f"Eval accuracy: {accuracy:.4f}, F1: {f1:.4f}, MAP: {map_score:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}")
-        
-        return loss, len(x_test), {
-            "accuracy": accuracy,
-            "f1_score": f1,
-            "map": map_score,
-            "precision": precision,
-            "recall": recall
+        loss, accuracy = model.evaluate(x_val, y_val, verbose=0)
+
+        y_pred_proba = model.predict(x_val, verbose=0)
+        y_pred = y_pred_proba.argmax(axis=1)
+
+        f1 = f1_score(y_val, y_pred, average="weighted", zero_division=0)
+        precision = precision_score(y_val, y_pred, average="weighted", zero_division=0)
+        recall = recall_score(y_val, y_pred, average="weighted", zero_division=0)
+
+        map_score = average_precision_score(y_val, y_pred_proba[:, 1])
+
+        print(
+            f"Client {args.client_id} eval accuracy: {accuracy:.4f}, "
+            f"F1: {f1:.4f}, MAP: {map_score:.4f}, "
+            f"Precision: {precision:.4f}, Recall: {recall:.4f}"
+        )
+
+        return loss, len(x_val), {
+            "accuracy": float(accuracy),
+            "f1_score": float(f1),
+            "map": float(map_score),
+            "precision": float(precision),
+            "recall": float(recall),
         }
 
-# Start Flower client
+
 fl.client.start_numpy_client(
-    server_address="192.168.137.68:3040", 
-        client=FlowerClient()
+    server_address=args.server_address,
+    client=FlowerClient(),
 )

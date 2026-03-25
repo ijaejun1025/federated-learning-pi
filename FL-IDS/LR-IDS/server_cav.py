@@ -9,11 +9,11 @@ import utils_cav
 import tensorflow as tf
 from flwr.common import parameters_to_ndarrays
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-from sklearn.model_selection import train_test_split
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROUND_METRICS_CSV = os.path.join(BASE_DIR, "round_metrics.csv")
 TEST_SIZE = 0.33
+RANDOM_STATE = 41
 
 
 def build_model(input_shape):
@@ -107,26 +107,15 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         return loss, metrics
 
-# Load data for server-side evaluation
-x, y = utils_cav.load_cav()
-_, x_test, _, y_test = train_test_split(
-    x,
-    y,
+_, x_test, _, y_test = utils_cav.get_global_train_test_split(
     test_size=TEST_SIZE,
-    random_state=41,
-    shuffle=True,
-    stratify=y,
+    random_state=RANDOM_STATE,
 )
-if x_test.ndim == 2:
-    x_test = x_test[:, :, np.newaxis, np.newaxis]
+x_test = utils_cav.reshape_for_cnn(x_test)
 
 model = build_model((x_test.shape[1], x_test.shape[2], x_test.shape[3]))
-
-# Create strategy and run server
 strategy = SaveModelStrategy(evaluate_fn=get_evaluate_fn(model, x_test, y_test))
 
-# Start Flower server for three rounds of federated learning with 1Gb of data
-# Start Flower server
 fl.server.start_server(
     server_address="0.0.0.0:3040",
     config=fl.server.ServerConfig(num_rounds=3),

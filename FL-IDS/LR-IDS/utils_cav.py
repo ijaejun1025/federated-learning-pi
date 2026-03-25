@@ -8,9 +8,12 @@ import shutil
 import urllib.request
 import zipfile
 
+from typing import Tuple
+
 import numpy as np
 import pandas as pd
 from sklearn import preprocessing
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, train_test_split
 from sklearn.preprocessing import StandardScaler
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -26,6 +29,9 @@ REQUIRED_CAV_FILES = [
     "gear_dataset.csv",
     "RPM_dataset.csv",
 ]
+
+# Columns that are labels or direct label encodings and must never be used as features.
+LABEL_LEAKAGE_COLUMNS = {"AttackType", "intrusion", "Normal", "ATTACK"}
 
 
 def _find_file_recursively(root_dir: str, file_name: str):
@@ -138,18 +144,80 @@ def _build_cav_anomaly_csv() -> None:
     bin_data.to_csv(ANOMALY_CSV_PATH, index=False)
 
 
-def load_cav():
+def load_cav() -> Tuple[np.ndarray, np.ndarray]:
+    """Load CAV dataset without label leakage.
+
+    Returns
+    -------
+    x : np.ndarray
+        Standardized numeric feature matrix excluding all label-related columns.
+    y : np.ndarray
+        Encoded binary labels (0/1).
+    """
     if not os.path.exists(ANOMALY_CSV_PATH):
         _build_cav_anomaly_csv()
 
-    data = pd.read_csv(ANOMALY_CSV_PATH)
-    data = data.reset_index(drop=True)
+    data = pd.read_csv(ANOMALY_CSV_PATH).reset_index(drop=True)
 
-    numeric_cols = data.select_dtypes(include="number").columns
-    X = data[numeric_cols].values
     y = data["AttackType"].values
 
-    x = StandardScaler().fit_transform(X)
+    feature_cols = [
+        col for col in data.columns
+        if col not in LABEL_LEAKAGE_COLUMNS and pd.api.types.is_numeric_dtype(data[col])
+    ]
+    if not feature_cols:
+        raise ValueError("No usable numeric feature columns found after removing label leakage columns.")
+
+    X = data[feature_cols].to_numpy(dtype=np.float32)
+    x = StandardScaler().fit_transform(X).astype(np.float32)
+
     label_encoder = preprocessing.LabelEncoder()
-    y = label_encoder.fit_transform(y)
+    y = label_encoder.fit_transform(y).astype(np.int64)
     return x, y
+
+
+def reshape_for_cnn(x: np.ndarray) -> np.ndarray:
+    if x.ndim == 2:
+        return x[:, :, np.newaxis, np.newaxis].astype(np.float32)
+    return x.astype(np.float32)
+
+
+def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
+    x, y = load_cav()
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+    train_idx, test_idx = next(splitter.split(x, y))
+    return x[train_idx], x[test_idx], y[train_idx], y[test_idx]
+
+
+def get_client_partition(
+    client_id: int,
+    num_clients: int,
+    test_size: float = 0.33,
+    random_state: int = 41,
+    local_val_size: float = 0.2,
+):
+    if client_id < 0 or client_id >= num_clients:
+        raise ValueError(f"client_id must be between 0 and {num_clients - 1}, got {client_id}")
+
+    x_train_pool, _, y_train_pool, _ = get_global_train_test_split(
+        test_size=test_size,
+        random_state=random_state,
+    )
+
+    skf = StratifiedKFold(n_splits=num_clients, shuffle=True, random_state=random_state)
+    folds = list(skf.split(x_train_pool, y_train_pool))
+    _, client_indices = folds[client_id]
+
+    x_client = x_train_pool[client_indices]
+    y_client = y_train_pool[client_indices]
+
+    x_local_train, x_local_val, y_local_train, y_local_val = train_test_split(
+        x_client,
+        y_client,
+        test_size=local_val_size,
+        random_state=random_state + client_id,
+        shuffle=True,
+        stratify=y_client,
+    )
+
+    return x_local_train, x_local_val, y_local_train, y_local_val
