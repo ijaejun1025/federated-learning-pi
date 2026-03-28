@@ -39,7 +39,7 @@ def build_model(input_shape):
 
 
 def get_evaluate_fn(model, x_test, y_test):
-    labels = np.unique(y_test)
+    labels = [0, 1]
 
     def evaluate(server_round, parameters, config):
         t_start = time.time()
@@ -53,22 +53,21 @@ def get_evaluate_fn(model, x_test, y_test):
         precision = precision_score(y_test, y_pred, average="weighted", zero_division=0)
         recall = recall_score(y_test, y_pred, average="weighted", zero_division=0)
         f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
-        detection_rate = recall  # TP / (TP + FN), identical to recall in binary IDS context
+        detection_rate = recall_score(y_test, y_pred, pos_label=1, zero_division=0)
         mcc = matthews_corrcoef(y_test, y_pred)
         roc_auc = roc_auc_score(y_test, y_pred_proba[:, 1])
         cm = confusion_matrix(y_test, y_pred, labels=labels)
 
-        # FPR: FP / (FP + TN) — extracted from confusion matrix (binary: row 0 = Normal)
+        # Binary convention is fixed by utils_cav.LABEL_TO_INT: 0 = Normal, 1 = Attack.
         tn, fp = cm[0, 0], cm[0, 1]
         fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
 
-        # FNR: FN / (FN + TP) — extracted from confusion matrix (binary: row 1 = Attack)
         fn, tp = cm[1, 0], cm[1, 1]
         fnr = fn / (fn + tp) if (fn + tp) > 0 else 0.0
 
         elapsed = time.time() - t_start
 
-        cm_df = pd.DataFrame(cm, index=[f"true_{label}" for label in labels], columns=[f"pred_{label}" for label in labels])
+        cm_df = pd.DataFrame(cm, index=["true_normal", "true_attack"], columns=["pred_normal", "pred_attack"])
         cm_xlsx = os.path.join(BASE_DIR, f"confusion_matrix_round_{server_round}.xlsx")
         cm_df.to_excel(cm_xlsx, index=True)
         print(f"Round {server_round} confusion matrix:")

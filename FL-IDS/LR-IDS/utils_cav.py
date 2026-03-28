@@ -33,6 +33,7 @@ REQUIRED_CAV_FILES = [
 
 # Columns that are labels or direct label encodings and must never be used as features.
 LABEL_LEAKAGE_COLUMNS = {"AttackType", "intrusion", "Normal", "ATTACK"}
+LABEL_TO_INT = {"Normal": 0, "ATTACK": 1}
 
 
 def _find_file_recursively(root_dir: str, file_name: str):
@@ -171,8 +172,12 @@ def load_cav() -> Tuple[np.ndarray, np.ndarray]:
 
     x = data[feature_cols].to_numpy(dtype=np.float32)
 
-    label_encoder = preprocessing.LabelEncoder()
-    y = label_encoder.fit_transform(y).astype(np.int64)
+    y = data["AttackType"].map(LABEL_TO_INT)
+    if y.isnull().any():
+        unknown_labels = sorted(data.loc[y.isnull(), "AttackType"].unique().tolist())
+        raise ValueError(f"Unexpected labels found in AttackType column: {unknown_labels}")
+
+    y = y.to_numpy(dtype=np.int64)
     return x, y
 
 
@@ -189,9 +194,13 @@ def _get_or_build_global_split(test_size: float = 0.33, random_state: int = 41):
     Subsequent calls (from any process) load from the cache file so the split
     and scaler are shared without recomputation.
     """
+    if not os.path.exists(ANOMALY_CSV_PATH):
+        _build_cav_anomaly_csv()
+
+    source_mtime_ns = os.stat(ANOMALY_CSV_PATH).st_mtime_ns
     cache_path = os.path.join(
         GLOBAL_SPLIT_CACHE_DIR,
-        f"split_ts{test_size}_rs{random_state}.npz",
+        f"split_ts{test_size}_rs{random_state}_src{source_mtime_ns}.npz",
     )
 
     if os.path.exists(cache_path):
