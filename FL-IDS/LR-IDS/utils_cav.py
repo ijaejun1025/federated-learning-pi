@@ -178,7 +178,8 @@ def load_cav() -> Tuple[np.ndarray, np.ndarray]:
 
 def reshape_for_cnn(x: np.ndarray) -> np.ndarray:
     if x.ndim == 2:
-        return x[:, :, np.newaxis, np.newaxis].astype(np.float32)
+        # Conv1D expects (samples, timesteps, channels)
+        return x[:, :, np.newaxis].astype(np.float32)
     return x.astype(np.float32)
 
 

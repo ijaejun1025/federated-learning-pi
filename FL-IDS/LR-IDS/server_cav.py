@@ -22,9 +22,10 @@ RANDOM_STATE = 41
 def build_model(input_shape):
     model = tf.keras.Sequential(
         [
-            tf.keras.layers.Conv2D(96, (4, 4), input_shape=input_shape, activation="relu", padding="same"),
-            tf.keras.layers.Conv2D(64, (3, 3), activation="relu", padding="same"),
-            tf.keras.layers.Conv2D(32, (2, 2), activation="relu", padding="same"),
+            tf.keras.layers.Input(shape=input_shape),
+            tf.keras.layers.Conv1D(96, 4, activation="relu", padding="same"),
+            tf.keras.layers.Conv1D(64, 3, activation="relu", padding="same"),
+            tf.keras.layers.Conv1D(32, 2, activation="relu", padding="same"),
             tf.keras.layers.Dropout(0.5),
             tf.keras.layers.Flatten(),
             tf.keras.layers.Dense(512, activation="relu"),
@@ -120,7 +121,7 @@ _, x_test, _, y_test = utils_cav.get_global_train_test_split(
 )
 x_test = utils_cav.reshape_for_cnn(x_test)
 
-model = build_model((x_test.shape[1], x_test.shape[2], x_test.shape[3]))
+model = build_model((x_test.shape[1], x_test.shape[2]))
 strategy = fl.server.strategy.FedAvg(evaluate_fn=get_evaluate_fn(model, x_test, y_test))
 
 fl.server.start_server(

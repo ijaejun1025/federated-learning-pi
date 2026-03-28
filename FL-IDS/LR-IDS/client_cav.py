@@ -5,7 +5,6 @@ import argparse
 
 import flwr as fl
 import numpy as np
-import tensorflow as tf
 from tensorflow import keras
 from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score
 
@@ -20,9 +19,9 @@ LOCAL_VAL_SIZE = 0.2
 def build_model(input_shape):
     model = keras.Sequential([
         keras.layers.Input(shape=input_shape),
-        keras.layers.Conv2D(96, (4, 4), activation="relu", padding="same"),
-        keras.layers.Conv2D(64, (3, 3), activation="relu", padding="same"),
-        keras.layers.Conv2D(32, (2, 2), activation="relu", padding="same"),
+        keras.layers.Conv1D(96, 4, activation="relu", padding="same"),
+        keras.layers.Conv1D(64, 3, activation="relu", padding="same"),
+        keras.layers.Conv1D(32, 2, activation="relu", padding="same"),
         keras.layers.Dropout(0.5),
         keras.layers.Flatten(),
         keras.layers.Dense(512, activation="relu"),
@@ -51,7 +50,11 @@ x_train, x_val, y_train, y_val = utils_cav.get_client_partition(
 x_train = utils_cav.reshape_for_cnn(x_train)
 x_val = utils_cav.reshape_for_cnn(x_val)
 
-model = build_model((x_train.shape[1], x_train.shape[2], x_train.shape[3]))
+# Compute per-class weights to counter class imbalance
+_counts = np.bincount(y_train)
+class_weight = {i: len(y_train) / (len(_counts) * c) for i, c in enumerate(_counts)}
+
+model = build_model((x_train.shape[1], x_train.shape[2]))
 model.summary()
 
 
@@ -66,6 +69,7 @@ class FlowerClient(fl.client.NumPyClient):
             y_train,
             epochs=3,
             validation_data=(x_val, y_val),
+            class_weight=class_weight,
             verbose=1,
         )
         print("Fit history:", history.history)
