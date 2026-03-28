@@ -19,6 +19,7 @@ from sklearn.preprocessing import StandardScaler
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CAV_DIR = os.path.join(BASE_DIR, "cav")
 ANOMALY_CSV_PATH = os.path.join(BASE_DIR, "cav_anoamly.csv")
+GLOBAL_SPLIT_CACHE_DIR = os.path.join(BASE_DIR, "split_cache")
 DROPBOX_CAV_ZIP_URL = (
     "https://www.dropbox.com/scl/fo/9rwsf9pclhvv9xxloojom/AF7JeRW893grZkigkulkAHk"
     "?rlkey=3h6zamu3kc262lrnipu5qden8&dl=1"
@@ -145,12 +146,12 @@ def _build_cav_anomaly_csv() -> None:
 
 
 def load_cav() -> Tuple[np.ndarray, np.ndarray]:
-    """Load CAV dataset without label leakage.
+    """Load raw CAV features and labels without label leakage.
 
     Returns
     -------
     x : np.ndarray
-        Standardized numeric feature matrix excluding all label-related columns.
+        Raw numeric feature matrix excluding all label-related columns.
     y : np.ndarray
         Encoded binary labels (0/1).
     """
@@ -168,8 +169,7 @@ def load_cav() -> Tuple[np.ndarray, np.ndarray]:
     if not feature_cols:
         raise ValueError("No usable numeric feature columns found after removing label leakage columns.")
 
-    X = data[feature_cols].to_numpy(dtype=np.float32)
-    x = StandardScaler().fit_transform(X).astype(np.float32)
+    x = data[feature_cols].to_numpy(dtype=np.float32)
 
     label_encoder = preprocessing.LabelEncoder()
     y = label_encoder.fit_transform(y).astype(np.int64)
@@ -183,11 +183,43 @@ def reshape_for_cnn(x: np.ndarray) -> np.ndarray:
     return x.astype(np.float32)
 
 
-def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
+def _get_or_build_global_split(test_size: float = 0.33, random_state: int = 41):
+    """Compute the global train/test split exactly once and cache it to disk.
+
+    Subsequent calls (from any process) load from the cache file so the split
+    and scaler are shared without recomputation.
+    """
+    cache_path = os.path.join(
+        GLOBAL_SPLIT_CACHE_DIR,
+        f"split_ts{test_size}_rs{random_state}.npz",
+    )
+
+    if os.path.exists(cache_path):
+        data = np.load(cache_path)
+        return data["x_train"], data["x_test"], data["y_train"], data["y_test"]
+
     x, y = load_cav()
     splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
     train_idx, test_idx = next(splitter.split(x, y))
-    return x[train_idx], x[test_idx], y[train_idx], y[test_idx]
+
+    x_train = x[train_idx]
+    x_test = x[test_idx]
+    y_train = y[train_idx]
+    y_test = y[test_idx]
+
+    # Fit scaler on train only — no leakage
+    scaler = StandardScaler().fit(x_train)
+    x_train = scaler.transform(x_train).astype(np.float32)
+    x_test = scaler.transform(x_test).astype(np.float32)
+
+    os.makedirs(GLOBAL_SPLIT_CACHE_DIR, exist_ok=True)
+    np.savez(cache_path, x_train=x_train, x_test=x_test, y_train=y_train, y_test=y_test)
+
+    return x_train, x_test, y_train, y_test
+
+
+def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
+    return _get_or_build_global_split(test_size=test_size, random_state=random_state)
 
 
 def get_client_partition(
