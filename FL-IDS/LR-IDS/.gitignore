@@ -20,4 +20,10 @@ cav/Fuzzy_dataset.csv
 cav/gear_dataset.csv
 cav/RPM_dataset.csv
 prediction_results.csv
+OTIDS Dataset/
+Survival Analysis Dataset/
+CICIoV2024/
+ROAD Dataset/
+CAN-MIRGU/
+split_cache/
 

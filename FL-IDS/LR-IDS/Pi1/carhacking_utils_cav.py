@@ -13,13 +13,14 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 from sklearn import preprocessing
-from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, train_test_split
-from sklearn.preprocessing import StandardScaler
+
+import common_cav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CAV_DIR = os.path.join(BASE_DIR, "cav")
+LOCAL_CAV_DIR = os.path.join(BASE_DIR, "Car-Hacking Dataset")
+LEGACY_CAV_DIR = os.path.join(BASE_DIR, "cav")
+CAV_DIR = LOCAL_CAV_DIR if os.path.isdir(LOCAL_CAV_DIR) else LEGACY_CAV_DIR
 ANOMALY_CSV_PATH = os.path.join(BASE_DIR, "cav_anoamly.csv")
-GLOBAL_SPLIT_CACHE_DIR = os.path.join(BASE_DIR, "split_cache")
 DROPBOX_CAV_ZIP_URL = (
     "https://www.dropbox.com/scl/fo/9rwsf9pclhvv9xxloojom/AF7JeRW893grZkigkulkAHk"
     "?rlkey=3h6zamu3kc262lrnipu5qden8&dl=1"
@@ -33,7 +34,7 @@ REQUIRED_CAV_FILES = [
 
 # Columns that are labels or direct label encodings and must never be used as features.
 LABEL_LEAKAGE_COLUMNS = {"AttackType", "intrusion", "Normal", "ATTACK"}
-LABEL_TO_INT = {"Normal": 0, "ATTACK": 1}
+LABEL_TO_INT = common_cav.LABEL_TO_INT
 
 
 def _find_file_recursively(root_dir: str, file_name: str):
@@ -181,85 +182,62 @@ def load_cav() -> Tuple[np.ndarray, np.ndarray]:
     return x, y
 
 
-def reshape_for_cnn(x: np.ndarray) -> np.ndarray:
-    if x.ndim == 2:
-        # Conv1D expects (samples, timesteps, channels)
-        return x[:, :, np.newaxis].astype(np.float32)
-    return x.astype(np.float32)
+reshape_for_cnn = common_cav.reshape_for_cnn
+
+DATASET_KEY = "carhacking"
 
 
-def _get_or_build_global_split(test_size: float = 0.33, random_state: int = 41):
-    """Compute the global train/test split exactly once and cache it to disk.
+def _load_cav_for_cache():
+    if not os.path.exists(ANOMALY_CSV_PATH):
+        _build_cav_anomaly_csv()
+    return load_cav()
 
-    Subsequent calls (from any process) load from the cache file so the split
-    and scaler are shared without recomputation.
+
+def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
+    """Compute (or load from cache) the leak-safe global train/test split.
+
+    Shared across every process (client or server) that imports this module,
+    so the split and scaler are computed exactly once and reused.
     """
     if not os.path.exists(ANOMALY_CSV_PATH):
         _build_cav_anomaly_csv()
 
-    source_mtime_ns = os.stat(ANOMALY_CSV_PATH).st_mtime_ns
-    cache_path = os.path.join(
-        GLOBAL_SPLIT_CACHE_DIR,
-        f"split_ts{test_size}_rs{random_state}_src{source_mtime_ns}.npz",
+    source_version = common_cav.directory_signature([ANOMALY_CSV_PATH])
+    return common_cav.cache_scaled_split(
+        DATASET_KEY,
+        _load_cav_for_cache,
+        source_version,
+        BASE_DIR,
+        test_size=test_size,
+        random_state=random_state,
     )
 
-    if os.path.exists(cache_path):
-        data = np.load(cache_path)
-        return data["x_train"], data["x_test"], data["y_train"], data["y_test"]
 
-    x, y = load_cav()
-    splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
-    train_idx, test_idx = next(splitter.split(x, y))
-
-    x_train = x[train_idx]
-    x_test = x[test_idx]
-    y_train = y[train_idx]
-    y_test = y[test_idx]
-
-    # Fit scaler on train only — no leakage
-    scaler = StandardScaler().fit(x_train)
-    x_train = scaler.transform(x_train).astype(np.float32)
-    x_test = scaler.transform(x_test).astype(np.float32)
-
-    os.makedirs(GLOBAL_SPLIT_CACHE_DIR, exist_ok=True)
-    np.savez(cache_path, x_train=x_train, x_test=x_test, y_train=y_train, y_test=y_test)
-
-    return x_train, x_test, y_train, y_test
-
-
-def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
-    return _get_or_build_global_split(test_size=test_size, random_state=random_state)
-
-
-def get_client_partition(
-    client_id: int,
-    num_clients: int,
+def get_client_data(
     test_size: float = 0.33,
     random_state: int = 41,
     local_val_size: float = 0.2,
 ):
-    if client_id < 0 or client_id >= num_clients:
-        raise ValueError(f"client_id must be between 0 and {num_clients - 1}, got {client_id}")
-
+    """Give this client the entire Car-Hacking train pool (minus the held-out
+    test split reserved for server-side evaluation), split into local
+    train/val sets.
+    """
     x_train_pool, _, y_train_pool, _ = get_global_train_test_split(
         test_size=test_size,
         random_state=random_state,
     )
 
-    skf = StratifiedKFold(n_splits=num_clients, shuffle=True, random_state=random_state)
-    folds = list(skf.split(x_train_pool, y_train_pool))
-    _, client_indices = folds[client_id]
-
-    x_client = x_train_pool[client_indices]
-    y_client = y_train_pool[client_indices]
-
-    x_local_train, x_local_val, y_local_train, y_local_val = train_test_split(
-        x_client,
-        y_client,
-        test_size=local_val_size,
-        random_state=random_state + client_id,
-        shuffle=True,
-        stratify=y_client,
+    return common_cav.local_train_val_split(
+        x_train_pool,
+        y_train_pool,
+        val_size=local_val_size,
+        random_state=random_state,
     )
 
-    return x_local_train, x_local_val, y_local_train, y_local_val
+
+def get_test_split(test_size: float = 0.33, random_state: int = 41):
+    _, x_test, _, y_test = get_global_train_test_split(
+        test_size=test_size,
+        random_state=random_state,
+    )
+    return x_test, y_test
