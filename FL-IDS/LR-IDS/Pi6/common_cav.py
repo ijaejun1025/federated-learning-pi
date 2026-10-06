@@ -10,10 +10,12 @@ downstream of that (train/test caching, scaling, local train/val split) is
 identical across datasets and lives here so it isn't copy-pasted six times.
 """
 
+import glob
 import os
 import re
 import urllib.parse
 import urllib.request
+import zipfile
 
 from typing import Callable, Iterable, Sequence, Tuple
 
@@ -166,16 +168,62 @@ def reshape_for_cnn(x: np.ndarray) -> np.ndarray:
     return x.astype(np.float32)
 
 
-def build_frame_features(can_id: int, dlc: int, data_bytes: Sequence[int]) -> list:
-    """Build one ``[CAN_ID, DLC, DATA0..DATA7]`` feature row.
+def build_frame_features(dlc: int, data_bytes: Sequence[int]) -> list:
+    """Build one ``[DLC, DATA0..DATA7]`` feature row.
 
-    ``data_bytes`` shorter than 8 is zero-padded; longer is truncated. This
-    keeps every dataset's feature width identical regardless of how many
-    data bytes a given frame actually carried.
+    CAN ID is deliberately not a feature: the OTIDS DoS/Impersonation labels
+    are defined on it, so including it lets the model read the label off the
+    input. ``data_bytes`` shorter than 8 is zero-padded.
     """
     padded = list(data_bytes[:NUM_DATA_BYTES])
     padded += [0] * (NUM_DATA_BYTES - len(padded))
-    return [can_id, dlc] + padded
+    return [dlc] + padded
+
+
+def split_time_blocks(n_rows: int, test_blocks=(2, 5, 8), n_blocks: int = 10, buffer_frac: float = 0.005):
+    """Split one time-ordered capture into contiguous blocks.
+
+    Blocks listed in ``test_blocks`` go to test. Train blocks give up
+    ``buffer_frac`` of their rows at each end so frames next to a boundary
+    never land on the other side. Returns row indices (train, test).
+    """
+    idx = np.arange(n_rows)
+    buf = int(n_rows * buffer_frac)
+    train, test = [], []
+    for b, block in enumerate(np.array_split(idx, n_blocks)):
+        if b in test_blocks:
+            test.append(block)
+        else:
+            train.append(block[buf:len(block) - buf] if len(block) > 2 * buf else block)
+    return np.concatenate(train), np.concatenate(test)
+
+
+def cache_precomputed_split(
+    dataset_key: str,
+    base_dir: str,
+    x_train: np.ndarray,
+    x_test: np.ndarray,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    source_version: int,
+    test_size: float = 0.33,
+    random_state: int = 41,
+):
+    """Scale a split whose train/test membership was decided by the caller
+    (e.g. time blocks or whole files) and cache it. The scaler is fit on the
+    train side only."""
+    scaler = StandardScaler().fit(x_train)
+    x_train = scaler.transform(x_train).astype(np.float32)
+    x_test = scaler.transform(x_test).astype(np.float32)
+
+    cache_dir = os.path.join(base_dir, "split_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(
+        cache_dir,
+        f"{dataset_key}_ts{test_size}_rs{random_state}_src{source_version}.npz",
+    )
+    np.savez(cache_path, x_train=x_train, x_test=x_test, y_train=y_train, y_test=y_test)
+    return x_train, x_test, y_train, y_test
 
 
 def directory_signature(paths: Iterable[str]) -> int:
@@ -189,6 +237,116 @@ def directory_signature(paths: Iterable[str]) -> int:
         if os.path.exists(path):
             total += os.stat(path).st_mtime_ns
     return total
+
+
+def _read_exact(f, nbytes: int) -> bytes:
+    chunks = []
+    remaining = nbytes
+    while remaining:
+        data = f.read(remaining)
+        if not data:
+            raise EOFError("unexpected end of cached array data")
+        chunks.append(data)
+        remaining -= len(data)
+    return b"".join(chunks)
+
+
+def _iter_npy_rows(zf: zipfile.ZipFile, member: str, chunk_rows: int):
+    """Yield an ``.npy`` array stored inside an ``.npz`` in row chunks,
+    without loading the whole array into memory."""
+    with zf.open(member) as f:
+        version = np.lib.format.read_magic(f)
+        if version == (1, 0):
+            shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(f)
+        else:
+            shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(f)
+        if fortran_order:
+            raise ValueError(f"{member} is Fortran-ordered; expected row-major")
+        n_rows = shape[0]
+        row_shape = tuple(shape[1:])
+        row_bytes = int(np.prod(row_shape, dtype=np.int64)) * dtype.itemsize
+        done = 0
+        while done < n_rows:
+            take = min(chunk_rows, n_rows - done)
+            buf = _read_exact(f, take * row_bytes)
+            yield np.frombuffer(buf, dtype=dtype).reshape((take,) + row_shape)
+            done += take
+
+
+def load_cached_train_fraction(
+    dataset_key: str,
+    base_dir: str,
+    fraction: float,
+    test_size: float = 0.33,
+    random_state: int = 41,
+    chunk_rows: int = 1_000_000,
+):
+    """Return a uniform random ``fraction`` of the cached training pool,
+    reading only ``x_train``/``y_train`` and streaming in chunks so the full
+    pool (and the test arrays) never sit in memory at once.
+
+    Every row is kept with the same probability, so each class keeps
+    (in expectation) its original share -- stratified sampling in effect.
+    Returns ``None`` if no cache file exists for this dataset.
+    """
+    pattern = os.path.join(
+        base_dir, "split_cache",
+        f"{dataset_key}_ts{test_size}_rs{random_state}_src*.npz",
+    )
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        return None
+
+    rng = np.random.default_rng(random_state)
+    x_parts = []
+    y_parts = []
+    with zipfile.ZipFile(matches[0]) as zf:
+        x_chunks = _iter_npy_rows(zf, "x_train.npy", chunk_rows)
+        y_chunks = _iter_npy_rows(zf, "y_train.npy", chunk_rows)
+        for x_chunk, y_chunk in zip(x_chunks, y_chunks):
+            keep = rng.random(len(x_chunk)) < fraction
+            x_parts.append(x_chunk[keep])
+            y_parts.append(y_chunk[keep])
+    return np.concatenate(x_parts), np.concatenate(y_parts)
+
+
+def subsample_rows(x: np.ndarray, y: np.ndarray, fraction: float, random_state: int = 41):
+    """Same uniform-rate subsampling as ``load_cached_train_fraction``, for
+    data that is already fully in memory (fallback when no cache exists)."""
+    rng = np.random.default_rng(random_state)
+    keep = rng.random(len(x)) < fraction
+    return x[keep], y[keep]
+
+
+def find_any_cached_split(
+    dataset_key: str,
+    base_dir: str,
+    test_size: float = 0.33,
+    random_state: int = 41,
+):
+    """Load a cached split for ``dataset_key`` if one exists, regardless of
+    the raw source files' mtimes (i.e. without needing the raw dataset
+    present at all).
+
+    ``cache_scaled_split`` normally keys its cache filename on a
+    ``source_version`` signature computed from the raw files' mtimes, which
+    means using the cache still requires the (often multi-GB) raw dataset to
+    be present locally just to recompute that signature -- pointless once
+    the cache has already been built once (e.g. on a dev machine) and only
+    the small ``split_cache/*.npz`` file is copied to a disk-constrained
+    device like a Jetson. This instead globs for *any* cache file matching
+    this dataset/test_size/random_state, ignoring the source suffix, and
+    returns it if found -- callers should call this first and only fall
+    back to ensuring the raw files exist if it returns ``None``.
+    """
+    import glob as _glob
+
+    pattern = os.path.join(base_dir, "split_cache", f"{dataset_key}_ts{test_size}_rs{random_state}_src*.npz")
+    matches = sorted(_glob.glob(pattern))
+    if not matches:
+        return None
+    data = np.load(matches[0])
+    return data["x_train"], data["x_test"], data["y_train"], data["y_test"]
 
 
 def cache_scaled_split(

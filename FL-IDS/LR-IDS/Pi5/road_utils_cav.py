@@ -44,7 +44,10 @@ import common_cav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROAD_DIR = os.path.join(BASE_DIR, "ROAD Dataset")
-DATASET_KEY = "road"
+DATASET_KEY = "road_blk"
+# Fraction of the ~19M-row training pool this client actually trains on.
+# Sized so the client fits in a 1GB Raspberry Pi; the test split is unchanged.
+CLIENT_TRAIN_FRACTION = 0.10
 SOURCE_URL = "https://zenodo.org/records/10462796"
 ZENODO_RECORD_API = "https://zenodo.org/api/records/10462796"
 
@@ -120,62 +123,78 @@ def _load_all_capture_metadata() -> dict:
     return metadata
 
 
-def _load_raw_road():
-    log_files = _ensure_raw_files()
+def _capture_arrays(path: str, capture_metadata: dict):
+    """Features and labels for one capture, in time order."""
+    rows = common_cav.parse_candump_file(path)
+    x = np.asarray(
+        [common_cav.build_frame_features(dlc, data) for _, _, dlc, data in rows],
+        dtype=np.float32,
+    )
+    if _is_ambient(path):
+        y = np.zeros(len(rows), dtype=np.int64)
+        return x, y
+
+    capture_name = os.path.splitext(os.path.basename(path))[0]
+    entry = capture_metadata.get(capture_name)
+    interval = entry.get("injection_interval") if entry else None
+    if entry is None:
+        # No metadata entry at all: whole-file fallback.
+        y = np.ones(len(rows), dtype=np.int64)
+    elif interval is None:
+        # Metadata entry with null interval: accelerator-attack captures,
+        # which have no injected messages (ROAD readme).
+        y = np.zeros(len(rows), dtype=np.int64)
+    else:
+        t0 = rows[0][0] if rows else 0.0
+        t = np.array([r[0] - t0 for r in rows])
+        y = ((t >= interval[0]) & (t <= interval[1])).astype(np.int64)
+    return x, y
+
+
+def _load_block_split():
     capture_metadata = _load_all_capture_metadata()
+    # Masquerade variants are near-copies of their original capture; keeping
+    # both would let the same frames appear on both sides of the split.
+    log_files = [p for p in _ensure_raw_files() if "_masquerade" not in os.path.basename(p)]
 
-    # GrowableArray fills numpy buffers directly instead of accumulating
-    # Python lists first, keeping peak memory closer to the final arrays'
-    # size (important on a Raspberry Pi's limited RAM).
-    features = common_cav.GrowableArray(num_cols=10, dtype=np.float32)
-    labels = common_cav.GrowableArray(num_cols=1, dtype=np.int64)
-
-    def _add(can_id, dlc, data_bytes, label_str):
-        features.append(common_cav.build_frame_features(can_id, dlc, data_bytes))
-        labels.append((common_cav.LABEL_TO_INT[label_str],))
-
+    parts = []
     for path in log_files:
-        parsed_rows = common_cav.parse_candump_file(path)
+        x, y = _capture_arrays(path, capture_metadata)
+        train_idx, test_idx = common_cav.split_time_blocks(len(y))
+        parts.append((x[train_idx], y[train_idx], x[test_idx], y[test_idx]))
 
-        if _is_ambient(path):
-            for _, can_id, dlc, data_bytes in parsed_rows:
-                _add(can_id, dlc, data_bytes, "Normal")
-            continue
-
-        capture_name = os.path.splitext(os.path.basename(path))[0]
-        entry = capture_metadata.get(capture_name)
-        interval = entry.get("injection_interval") if entry else None
-        t0 = parsed_rows[0][0] if parsed_rows else 0.0
-
-        for timestamp, can_id, dlc, data_bytes in parsed_rows:
-            if interval is not None:
-                t_rel = timestamp - t0
-                is_attack = interval[0] <= t_rel <= interval[1]
-                _add(can_id, dlc, data_bytes, "ATTACK" if is_attack else "Normal")
-            elif entry is not None:
-                # Metadata entry exists but injection_interval is null:
-                # ROAD's readme documents this for accelerator-attack
-                # captures, which have no injected messages -- label Normal.
-                _add(can_id, dlc, data_bytes, "Normal")
-            else:
-                # No metadata entry at all for this capture: coarse
-                # whole-file fallback.
-                _add(can_id, dlc, data_bytes, "ATTACK")
-
-    return features.finalize(), labels.finalize().ravel()
+    x_train = np.concatenate([p[0] for p in parts])
+    y_train = np.concatenate([p[1] for p in parts])
+    x_test = np.concatenate([p[2] for p in parts])
+    y_test = np.concatenate([p[3] for p in parts])
+    return x_train, x_test, y_train, y_test
 
 
 def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
+    cached = common_cav.find_any_cached_split(DATASET_KEY, BASE_DIR, test_size, random_state)
+    if cached is not None:
+        # A split_cache/*.npz already exists -- use it without ever
+        # touching the (3GB) raw dataset, e.g. on a disk-constrained device
+        # that only has the cache copied onto it.
+        return cached
+
     log_files = _ensure_raw_files()
     source_version = common_cav.directory_signature(log_files + _find_metadata_files())
-    return common_cav.cache_scaled_split(
-        DATASET_KEY, _load_raw_road, source_version, BASE_DIR,
-        test_size=test_size, random_state=random_state,
+    x_train, x_test, y_train, y_test = _load_block_split()
+    return common_cav.cache_precomputed_split(
+        DATASET_KEY, BASE_DIR, x_train, x_test, y_train, y_test,
+        source_version, test_size, random_state,
     )
 
 
 def get_client_data(test_size: float = 0.33, random_state: int = 41, local_val_size: float = 0.2):
-    x_train_pool, _, y_train_pool, _ = get_global_train_test_split(test_size, random_state)
+    pool = common_cav.load_cached_train_fraction(
+        DATASET_KEY, BASE_DIR, CLIENT_TRAIN_FRACTION, test_size, random_state,
+    )
+    if pool is None:
+        x_full, _, y_full, _ = get_global_train_test_split(test_size, random_state)
+        pool = common_cav.subsample_rows(x_full, y_full, CLIENT_TRAIN_FRACTION, random_state)
+    x_train_pool, y_train_pool = pool
     return common_cav.local_train_val_split(x_train_pool, y_train_pool, local_val_size, random_state)
 
 

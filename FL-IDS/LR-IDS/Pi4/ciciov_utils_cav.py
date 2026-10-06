@@ -1,39 +1,24 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-"""CIC IoV Dataset 2024 (CICIoV2024) loader — Pi4 (2019 Ford, CAN bus DoS
+"""CIC IoV Dataset 2024 (CICIoV2024) loader -- Pi4 (2019 Ford, CAN bus DoS
 and spoofing attacks).
 
-UNB's Canadian Institute for Cybersecurity gates the original download
-behind a personal-info request form (name/email/organization/job
-title/country submitted to https://cicresearch.ca/IOTDataset/CICIoV2024/),
-confirmed by fetching that page directly -- there is no stable public URL
-to script around that, so a human has to submit the form once:
-    https://www.unb.ca/cic/datasets/iov-dataset-2024.html
-The form hands back a ``CICIoV2024.tar.xz`` download. To auto-download on
-every Pi/run after that one-time step, this loader instead pulls the exact
-same file from the project owner's own Google Drive mirror (uploaded after
-completing the form; shared as "anyone with the link", confirmed to serve
-the real file directly -- this only works for this project's own Pi4 setup,
-since it's this owner's private mirror, not CIC's). If that download fails
-(e.g. no network, or the mirror is removed), this loader falls back to
-looking for a manually-placed file: drop ``CICIoV2024.tar.xz`` (unmodified)
-directly under ``CICIoV2024/`` next to this module and it will be extracted
-automatically (Python's stdlib ``tarfile`` reads ``.tar.xz`` natively);
-extracting it yourself first and placing the ``decimal/`` folder's CSVs
-there also works.
+Raw data: the official download is behind a personal-info request form at
+https://www.unb.ca/cic/datasets/iov-dataset-2024.html. The project owner's
+Google Drive mirror of ``CICIoV2024.tar.xz`` is used for automatic download;
+the archive contains binary/, decimal/ and hexadecimal/ representations and
+only ``decimal_*.csv`` matches this pipeline's schema.
 
-Confirmed against the real downloaded archive: it contains three parallel
-representations of the same captures -- ``binary/`` (one column per bit,
-incompatible with this pipeline's schema), ``hexadecimal/`` (hex-string
-``ID``/``DLC`` fields), and ``decimal/`` (plain integer ``ID`` and
-``DATA_0``..``DATA_7`` columns plus a ``label`` column of "BENIGN"/"ATTACK").
-Only ``decimal/`` matches the feature schema this pipeline expects, so this
-loader deliberately restricts itself to files named ``decimal_*.csv``
-(matching the archive's real naming, e.g. ``decimal_benign.csv``,
-``decimal_DoS.csv``, ``decimal_spoofing-GAS.csv``) rather than globbing
-every ``*.csv`` -- picking up a ``binary``/``hexadecimal`` file by accident
-would silently corrupt the feature values.
+The files carry no timestamp and each file holds a single class, so the
+split is by file where possible:
+- ``decimal_DoS.csv`` (attack) is held out entirely as the test attack type.
+- spoofing files (GAS/RPM/SPEED/STEERING_WHEEL) are training attacks.
+- the single benign file is split by row: 33% of rows go to test.
+
+Known limitation: the frames are highly repetitive (roughly 40 distinct
+attack frames in total), so the evaluation on this dataset is weak and
+should be reported as such.
 """
 
 import glob
@@ -47,11 +32,13 @@ import common_cav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CICIOV_DIR = os.path.join(BASE_DIR, "CICIoV2024")
-DATASET_KEY = "ciciov"
+DATASET_KEY = "ciciov_grp"
 SOURCE_URL = "https://www.unb.ca/cic/datasets/iov-dataset-2024.html"
 GOOGLE_DRIVE_FILE_ID = "1BTHtpfNhe0VN7dLTVhQz4-Q-A1szrQyD"
 
-CANDIDATE_ID_COLUMNS = ["ID", "id", "can_id", "CAN_ID", "CAN ID"]
+TEST_ATTACK_FILE = "decimal_DoS.csv"
+BENIGN_TEST_FRACTION = 0.33
+
 CANDIDATE_DLC_COLUMNS = ["DLC", "dlc"]
 CANDIDATE_DATA_COLUMNS = [
     [f"DATA_{i}" for i in range(8)],
@@ -61,6 +48,8 @@ CANDIDATE_DATA_COLUMNS = [
 ]
 CANDIDATE_LABEL_COLUMNS = ["label", "Label", "category", "Category", "specific_class"]
 BENIGN_TOKENS = {"benign", "normal"}
+
+reshape_for_cnn = common_cav.reshape_for_cnn
 
 
 def _find_csv_files():
@@ -85,9 +74,6 @@ def _download_and_extract_ciciov_dataset() -> None:
     _extract_tar_archives()
 
 
-reshape_for_cnn = common_cav.reshape_for_cnn
-
-
 def _ensure_raw_files() -> list:
     csv_files = _find_csv_files()
     if csv_files:
@@ -102,34 +88,19 @@ def _ensure_raw_files() -> list:
             _download_and_extract_ciciov_dataset()
         except Exception as error:
             raise FileNotFoundError(
-                f"No CICIoV2024 'decimal_*.csv' files found under "
-                f"'{CICIOV_DIR}', and automatic download failed ({error}). "
-                f"Request and download the dataset from {SOURCE_URL}, then "
-                f"either place the resulting CICIoV2024.tar.xz directly "
-                f"under '{CICIOV_DIR}' (it will be auto-extracted) or "
-                f"extract it yourself and place the 'decimal/' folder's "
-                f"CSVs there."
+                f"No CICIoV2024 'decimal_*.csv' files found under '{CICIOV_DIR}', "
+                f"and automatic download failed ({error}). Request and download "
+                f"the dataset from {SOURCE_URL}, then place CICIoV2024.tar.xz "
+                f"under '{CICIOV_DIR}' or the decimal/ CSVs there."
             ) from error
         csv_files = _find_csv_files()
 
     if not csv_files:
         raise FileNotFoundError(
             f"Downloaded/extracted CICIoV2024 but found no 'decimal_*.csv' "
-            f"files under '{CICIOV_DIR}' afterwards. Inspect the contents "
-            f"and adjust this loader if the layout differs."
+            f"files under '{CICIOV_DIR}'. Inspect the contents."
         )
     return csv_files
-
-
-def _resolve_single_column(df: pd.DataFrame, candidates, required: bool = True):
-    for name in candidates:
-        if name in df.columns:
-            return name
-    if required:
-        raise ValueError(
-            f"Could not find any of {candidates} in CICIoV2024 CSV columns: {list(df.columns)}"
-        )
-    return None
 
 
 def _resolve_data_columns(df: pd.DataFrame):
@@ -142,43 +113,73 @@ def _resolve_data_columns(df: pd.DataFrame):
     )
 
 
-def _read_frame_csv(path: str) -> pd.DataFrame:
+def _file_arrays(path: str):
     df = pd.read_csv(path)
-
-    id_col = _resolve_single_column(df, CANDIDATE_ID_COLUMNS)
-    dlc_col = _resolve_single_column(df, CANDIDATE_DLC_COLUMNS, required=False)
+    dlc_col = next((c for c in CANDIDATE_DLC_COLUMNS if c in df.columns), None)
     data_cols = _resolve_data_columns(df)
-    label_col = _resolve_single_column(df, CANDIDATE_LABEL_COLUMNS)
+    label_col = next((c for c in CANDIDATE_LABEL_COLUMNS if c in df.columns), None)
+    if label_col is None:
+        raise ValueError(f"No label column in {path}: {list(df.columns)}")
 
-    out = pd.DataFrame()
-    out["CAN ID"] = df[id_col]
-    out["Byte"] = df[dlc_col] if dlc_col is not None else 8
-    for i, col in enumerate(data_cols):
-        out[f"DATA[{i}]"] = df[col]
+    dlc = df[dlc_col].to_numpy(dtype=np.float32) if dlc_col else np.full(len(df), 8, np.float32)
+    data = df[list(data_cols)].to_numpy(dtype=np.float32)
+    x = np.column_stack([dlc, data]).astype(np.float32)
 
-    label_lower = df[label_col].astype(str).str.strip().str.lower()
-    out["AttackType"] = np.where(label_lower.isin(BENIGN_TOKENS), "Normal", "ATTACK")
-    return out.dropna()
-
-
-def _load_raw_ciciov():
-    csv_files = _ensure_raw_files()
-
-    frames = [_read_frame_csv(path) for path in csv_files]
-    dataset = pd.concat(frames, ignore_index=True)
-
-    feature_cols = ["CAN ID", "Byte"] + [f"DATA[{i}]" for i in range(8)]
-    x = dataset[feature_cols].to_numpy(dtype=np.float32)
-    y = dataset["AttackType"].map(common_cav.LABEL_TO_INT).to_numpy(dtype=np.int64)
+    label = df[label_col].astype(str).str.strip().str.lower()
+    y = (~label.isin(BENIGN_TOKENS)).to_numpy().astype(np.int64)
     return x, y
 
 
+KIND_BENIGN, KIND_SPOOF, KIND_DOS = 0, 1, 2
+
+
+def _load_split(random_state: int):
+    """Split by frame content. Identical feature rows (which are heavily
+    repeated in this dataset) are kept together on one side, so no test
+    frame value appears in training. DoS frames go to test, spoofing frames
+    to train; a frame value shared between DoS and spoofing goes to test."""
+    xs, ys, kinds = [], [], []
+    for path in _ensure_raw_files():
+        x, y = _file_arrays(path)
+        name = os.path.basename(path)
+        if name == TEST_ATTACK_FILE:
+            kind = KIND_DOS
+        elif y.sum() == 0:
+            kind = KIND_BENIGN
+        else:
+            kind = KIND_SPOOF
+        xs.append(x)
+        ys.append(y)
+        kinds.append(np.full(len(y), kind, dtype=np.int8))
+    x = np.concatenate(xs)
+    y = np.concatenate(ys)
+    kind = np.concatenate(kinds)
+
+    _, group = np.unique(x, axis=0, return_inverse=True)
+    group = group.ravel()
+    n_groups = int(group.max()) + 1
+    has_dos = np.bincount(group, weights=(kind == KIND_DOS), minlength=n_groups) > 0
+    has_spoof = np.bincount(group, weights=(kind == KIND_SPOOF), minlength=n_groups) > 0
+
+    rng = np.random.default_rng(random_state)
+    benign_group_to_test = rng.random(n_groups) < BENIGN_TEST_FRACTION
+    group_to_test = has_dos | (~has_spoof & benign_group_to_test)
+    is_test = group_to_test[group]
+
+    return x[~is_test], x[is_test], y[~is_test], y[is_test]
+
+
 def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
+    cached = common_cav.find_any_cached_split(DATASET_KEY, BASE_DIR, test_size, random_state)
+    if cached is not None:
+        return cached
+
     csv_files = _ensure_raw_files()
     source_version = common_cav.directory_signature(csv_files)
-    return common_cav.cache_scaled_split(
-        DATASET_KEY, _load_raw_ciciov, source_version, BASE_DIR,
-        test_size=test_size, random_state=random_state,
+    x_train, x_test, y_train, y_test = _load_split(random_state)
+    return common_cav.cache_precomputed_split(
+        DATASET_KEY, BASE_DIR, x_train, x_test, y_train, y_test,
+        source_version, test_size, random_state,
     )
 
 

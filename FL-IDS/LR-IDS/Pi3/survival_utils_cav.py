@@ -43,7 +43,7 @@ import common_cav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SURVIVAL_DIR = os.path.join(BASE_DIR, "Survival Analysis Dataset")
-DATASET_KEY = "survival"
+DATASET_KEY = "survival_blk"
 SOURCE_URL = "https://ocslab.hksecurity.net/Datasets/survival-ids"
 DROPBOX_SURVIVAL_ZIP_URL = (
     "https://www.dropbox.com/scl/fo/mqsp1orzaqjwu61j69amr/ANiI9XBqJHH5kLDUbrjrFw4"
@@ -139,29 +139,37 @@ def _parse_survival_file(path: str):
     return rows
 
 
-def _load_raw_survival():
-    txt_files = _ensure_raw_files()
+def _file_split(path: str):
+    rows = _parse_survival_file(path)
+    x = np.asarray(
+        [common_cav.build_frame_features(dlc, data) for _, dlc, data, _ in rows],
+        dtype=np.float32,
+    )
+    y = np.asarray([common_cav.LABEL_TO_INT[label] for *_, label in rows], dtype=np.int64)
+    train_idx, test_idx = common_cav.split_time_blocks(len(y))
+    return x[train_idx], y[train_idx], x[test_idx], y[test_idx]
 
-    # GrowableArray fills numpy buffers directly instead of accumulating
-    # Python lists first, keeping peak memory closer to the final arrays'
-    # size (important on a Raspberry Pi's limited RAM).
-    features = common_cav.GrowableArray(num_cols=10, dtype=np.float32)
-    labels = common_cav.GrowableArray(num_cols=1, dtype=np.int64)
 
-    for path in txt_files:
-        for can_id, dlc, data_bytes, label in _parse_survival_file(path):
-            features.append(common_cav.build_frame_features(can_id, dlc, data_bytes))
-            labels.append((common_cav.LABEL_TO_INT[label],))
-
-    return features.finalize(), labels.finalize().ravel()
+def _load_block_split():
+    parts = [_file_split(path) for path in _ensure_raw_files()]
+    x_train = np.concatenate([p[0] for p in parts])
+    y_train = np.concatenate([p[1] for p in parts])
+    x_test = np.concatenate([p[2] for p in parts])
+    y_test = np.concatenate([p[3] for p in parts])
+    return x_train, x_test, y_train, y_test
 
 
 def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
+    cached = common_cav.find_any_cached_split(DATASET_KEY, BASE_DIR, test_size, random_state)
+    if cached is not None:
+        return cached
+
     txt_files = _ensure_raw_files()
     source_version = common_cav.directory_signature(txt_files)
-    return common_cav.cache_scaled_split(
-        DATASET_KEY, _load_raw_survival, source_version, BASE_DIR,
-        test_size=test_size, random_state=random_state,
+    x_train, x_test, y_train, y_test = _load_block_split()
+    return common_cav.cache_precomputed_split(
+        DATASET_KEY, BASE_DIR, x_train, x_test, y_train, y_test,
+        source_version, test_size, random_state,
     )
 
 

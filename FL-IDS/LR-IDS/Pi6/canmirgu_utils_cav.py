@@ -61,7 +61,10 @@ import common_cav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CANMIRGU_DIR = os.path.join(BASE_DIR, "CAN-MIRGU")
-DATASET_KEY = "canmirgu"
+DATASET_KEY = "canmirgu_grp"
+# Fraction of the ~4.2M-row training pool this client actually trains on.
+# Sized so the client fits in a 1GB Raspberry Pi; the test split is unchanged.
+CLIENT_TRAIN_FRACTION = 0.40
 UCI_ZIP_URL = "https://archive.ics.uci.edu/static/public/1035/can-mirgu.zip"
 SOURCE_URLS = (
     "https://archive.ics.uci.edu/dataset/1035/can-mirgu",
@@ -211,35 +214,69 @@ def _rows_from_file(path: str):
     return common_cav.iter_candump_file(path, stride=LOG_SAMPLE_STRIDE)
 
 
-def _load_raw_canmirgu():
-    files = _ensure_raw_files()
+def _file_label(path: str) -> int:
+    return common_cav.LABEL_TO_INT[_classify_label(os.path.relpath(path, CANMIRGU_DIR))]
 
-    # GrowableArray fills numpy buffers directly instead of accumulating
-    # Python lists first -- with ~6M sampled rows expected, a plain list-of-
-    # lists approach here is what previously exhausted 16GB of RAM.
-    features = common_cav.GrowableArray(num_cols=10, dtype=np.float32)
-    labels = common_cav.GrowableArray(num_cols=1, dtype=np.int64)
 
+def _file_arrays(path: str):
+    rows = _rows_from_file(path)
+    x = np.asarray(
+        [common_cav.build_frame_features(dlc, data) for _, _, dlc, data in rows],
+        dtype=np.float32,
+    )
+    y = np.full(len(x), _file_label(path), dtype=np.int64)
+    return x, y
+
+
+def _load_group_split():
+    """Whole-file split: labels are constant within each file and each
+    masquerade file duplicates a real-attack capture, so masquerade files are
+    dropped and every 3rd benign and attack file is held out for test."""
+    files = [p for p in _ensure_raw_files() if "masquerade" not in os.path.basename(p).lower()]
+    benign = [p for p in files if _file_label(p) == 0]
+    attack = [p for p in files if _file_label(p) == 1]
+    test_files = set(benign[::3]) | set(attack[::3])
+
+    x_train, y_train, x_test, y_test = [], [], [], []
     for path in files:
-        label_value = common_cav.LABEL_TO_INT[_classify_label(path)]
-        for _, can_id, dlc, data_bytes in _rows_from_file(path):
-            features.append(common_cav.build_frame_features(can_id, dlc, data_bytes))
-            labels.append((label_value,))
-
-    return features.finalize(), labels.finalize().ravel()
+        x, y = _file_arrays(path)
+        if path in test_files:
+            x_test.append(x)
+            y_test.append(y)
+        else:
+            x_train.append(x)
+            y_train.append(y)
+    return (
+        np.concatenate(x_train), np.concatenate(x_test),
+        np.concatenate(y_train), np.concatenate(y_test),
+    )
 
 
 def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
+    cached = common_cav.find_any_cached_split(DATASET_KEY, BASE_DIR, test_size, random_state)
+    if cached is not None:
+        # A split_cache/*.npz already exists -- use it without ever
+        # touching the (5.5GB) raw dataset, e.g. on a disk-constrained
+        # device that only has the cache copied onto it.
+        return cached
+
     files = _ensure_raw_files()
     source_version = common_cav.directory_signature(files)
-    return common_cav.cache_scaled_split(
-        DATASET_KEY, _load_raw_canmirgu, source_version, BASE_DIR,
-        test_size=test_size, random_state=random_state,
+    x_train, x_test, y_train, y_test = _load_group_split()
+    return common_cav.cache_precomputed_split(
+        DATASET_KEY, BASE_DIR, x_train, x_test, y_train, y_test,
+        source_version, test_size, random_state,
     )
 
 
 def get_client_data(test_size: float = 0.33, random_state: int = 41, local_val_size: float = 0.2):
-    x_train_pool, _, y_train_pool, _ = get_global_train_test_split(test_size, random_state)
+    pool = common_cav.load_cached_train_fraction(
+        DATASET_KEY, BASE_DIR, CLIENT_TRAIN_FRACTION, test_size, random_state,
+    )
+    if pool is None:
+        x_full, _, y_full, _ = get_global_train_test_split(test_size, random_state)
+        pool = common_cav.subsample_rows(x_full, y_full, CLIENT_TRAIN_FRACTION, random_state)
+    x_train_pool, y_train_pool = pool
     return common_cav.local_train_val_split(x_train_pool, y_train_pool, local_val_size, random_state)
 
 

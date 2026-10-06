@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+import glob
 import time
 import flwr as fl
 import numpy as np
@@ -126,9 +127,21 @@ def get_evaluate_fn(model, x_test, y_test):
     return evaluate
 
 
+def report_cache_status(dataset_module):
+    pattern = os.path.join(
+        dataset_module.BASE_DIR, "split_cache",
+        f"{dataset_module.DATASET_KEY}_ts{TEST_SIZE}_rs{RANDOM_STATE}_src*.npz",
+    )
+    if glob.glob(pattern):
+        print(f"[CACHE] {dataset_module.DATASET_KEY}: found split_cache, no raw data download needed", flush=True)
+    else:
+        print(f"[CACHE] {dataset_module.DATASET_KEY}: NO split_cache found, raw data will be downloaded/processed", flush=True)
+
+
 x_test_parts = []
 y_test_parts = []
 for dataset_module in DATASET_MODULES:
+    report_cache_status(dataset_module)
     x_part, y_part = dataset_module.get_test_split(
         test_size=TEST_SIZE,
         random_state=RANDOM_STATE,
