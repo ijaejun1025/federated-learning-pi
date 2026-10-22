@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+import datetime
 import glob
 import time
 import flwr as fl
@@ -36,8 +37,98 @@ import survival_utils_cav
 from model_cav import build_model
 
 ROUND_METRICS_CSV = os.path.join(BASE_DIR, "round_metrics.csv")
+CLIENT_METRICS_CSV = os.path.join(BASE_DIR, "client_metrics.csv")
+PROGRESS_LOG = os.path.join(BASE_DIR, "progress_log.txt")
 TEST_SIZE = 0.33
 RANDOM_STATE = 41
+# Longest observed client round (Pi2, ~6.4h fit) plus margin, so a dropped
+# client ends its round instead of hanging the server indefinitely.
+ROUND_TIMEOUT_SEC = 10 * 3600
+
+
+def log_progress(message: str) -> None:
+    """Timestamped line to both stdout and progress_log.txt, so a round's
+    start/end and each client's response survive even if the tmux pane
+    scrollback is lost or the session dies."""
+    line = f"{datetime.datetime.now().isoformat(timespec='seconds')} {message}"
+    print(line, flush=True)
+    with open(PROGRESS_LOG, "a") as f:
+        f.write(line + "\n")
+
+
+def _record_client_metrics(server_round, client, eval_res) -> None:
+    """Append one row per Pi's own local-validation result for this round, so
+    all 6 clients' final numbers end up in one file on the server instead of
+    only printed on each Pi's own terminal."""
+    row = {
+        "round": server_round,
+        "client_name": eval_res.metrics.get("client_name", client.cid),
+        "num_examples": eval_res.num_examples,
+        "loss": eval_res.loss,
+    }
+    row.update({k: v for k, v in eval_res.metrics.items() if k != "client_name"})
+    pd.DataFrame([row]).to_csv(
+        CLIENT_METRICS_CSV,
+        mode="a",
+        header=not os.path.exists(CLIENT_METRICS_CSV),
+        index=False,
+    )
+
+
+def _stop_if_any_failure(phase: str, server_round: int, failures) -> None:
+    """A client that doesn't answer within ROUND_TIMEOUT_SEC shows up here as
+    a failure. All 6 Pis are required (min_*_clients=6), so rather than limp
+    on with a partial/undefined aggregation, log which client dropped and
+    kill the whole experiment immediately so it doesn't hang unattended."""
+    if not failures:
+        return
+    for failure in failures:
+        if isinstance(failure, BaseException):
+            log_progress(f"[ROUND {server_round}] {phase} FAILURE: {failure!r}")
+        else:
+            client, _ = failure
+            log_progress(f"[ROUND {server_round}] {phase} FAILURE, cid={client.cid}")
+    log_progress(
+        f"[ROUND {server_round}] {len(failures)} client(s) did not respond within "
+        f"{ROUND_TIMEOUT_SEC}s during {phase} -- stopping the experiment now."
+    )
+    os._exit(1)
+
+
+class LoggingFedAvg(fl.server.strategy.FedAvg):
+    """FedAvg with round start/end and per-client response logging."""
+
+    def configure_fit(self, server_round, parameters, client_manager):
+        log_progress(f"[ROUND {server_round}] fit round starting")
+        return super().configure_fit(server_round, parameters, client_manager)
+
+    def aggregate_fit(self, server_round, results, failures):
+        for client, fit_res in results:
+            name = fit_res.metrics.get("client_name", client.cid)
+            log_progress(
+                f"[ROUND {server_round}] fit OK from {name} "
+                f"(num_examples={fit_res.num_examples})"
+            )
+        _stop_if_any_failure("fit", server_round, failures)
+        log_progress(f"[ROUND {server_round}] fit round done: {len(results)} ok")
+        return super().aggregate_fit(server_round, results, failures)
+
+    def configure_evaluate(self, server_round, parameters, client_manager):
+        log_progress(f"[ROUND {server_round}] evaluate round starting")
+        return super().configure_evaluate(server_round, parameters, client_manager)
+
+    def aggregate_evaluate(self, server_round, results, failures):
+        for client, eval_res in results:
+            name = eval_res.metrics.get("client_name", client.cid)
+            log_progress(
+                f"[ROUND {server_round}] evaluate OK from {name} "
+                f"(num_examples={eval_res.num_examples})"
+            )
+            _record_client_metrics(server_round, client, eval_res)
+        _stop_if_any_failure("evaluate", server_round, failures)
+        log_progress(f"[ROUND {server_round}] evaluate round done: {len(results)} ok")
+        return super().aggregate_evaluate(server_round, results, failures)
+
 
 # One module per Raspberry Pi client; the server pools each dataset's
 # held-out test split into one combined evaluation set every round.
@@ -154,7 +245,7 @@ y_test = np.concatenate(y_test_parts)
 x_test = common_cav.reshape_for_cnn(x_test)
 
 model = build_model((x_test.shape[1], x_test.shape[2]))
-strategy = fl.server.strategy.FedAvg(
+strategy = LoggingFedAvg(
     evaluate_fn=get_evaluate_fn(model, x_test, y_test),
     min_fit_clients=len(DATASET_MODULES),
     min_evaluate_clients=len(DATASET_MODULES),
@@ -163,6 +254,6 @@ strategy = fl.server.strategy.FedAvg(
 
 fl.server.start_server(
     server_address="0.0.0.0:3040",
-    config=fl.server.ServerConfig(num_rounds=3),
+    config=fl.server.ServerConfig(num_rounds=3, round_timeout=ROUND_TIMEOUT_SEC),
     strategy=strategy,
 )

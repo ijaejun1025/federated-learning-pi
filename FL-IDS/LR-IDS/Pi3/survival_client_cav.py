@@ -13,6 +13,7 @@ from model_cav import build_model
 TEST_SIZE = 0.33
 RANDOM_STATE = 41
 LOCAL_VAL_SIZE = 0.2
+CLIENT_NAME = "Pi3-survival"
 
 
 parser = argparse.ArgumentParser()
@@ -52,7 +53,7 @@ class FlowerClient(fl.client.NumPyClient):
             verbose=1,
         )
         print("Fit history:", history.history)
-        return model.get_weights(), len(x_train), {}
+        return model.get_weights(), len(x_train), {"client_name": CLIENT_NAME}
 
     def evaluate(self, parameters, config):
         model.set_weights(parameters)
@@ -74,6 +75,7 @@ class FlowerClient(fl.client.NumPyClient):
         )
 
         return loss, len(x_val), {
+            "client_name": CLIENT_NAME,
             "accuracy": float(accuracy),
             "f1_score": float(f1),
             "map": float(map_score),
