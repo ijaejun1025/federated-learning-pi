@@ -9,10 +9,6 @@ import numpy as np
 import os
 import sys
 import pandas as pd
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, roc_auc_score, matthews_corrcoef,
-)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LR_IDS_DIR = os.path.dirname(BASE_DIR)
@@ -34,9 +30,11 @@ import common_cav
 import otids_utils_cav
 import road_utils_cav
 import survival_utils_cav
-from model_cav import build_model
+from model_cav import build_model, format_duration
 
+NUM_ROUNDS = 3
 ROUND_METRICS_CSV = os.path.join(BASE_DIR, "round_metrics.csv")
+DATASET_METRICS_CSV = os.path.join(BASE_DIR, "dataset_metrics.csv")
 CLIENT_METRICS_CSV = os.path.join(BASE_DIR, "client_metrics.csv")
 PROGRESS_LOG = os.path.join(BASE_DIR, "progress_log.txt")
 TEST_SIZE = 0.33
@@ -44,6 +42,14 @@ RANDOM_STATE = 41
 # Longest observed client round (Pi2, ~6.4h fit) plus margin, so a dropped
 # client ends its round instead of hanging the server indefinitely.
 ROUND_TIMEOUT_SEC = 10 * 3600
+# Rows per Keras call during server evaluation. Keras/TF need several hundred
+# bytes per row of the chunk on top of the data, so this sets the evaluation's
+# extra memory. A multiple of Keras' default batch size (32), so the batches
+# are the same as in one unchunked call.
+EVAL_CHUNK_ROWS = 262_144
+# Keras clips probabilities to [eps, 1 - eps] before taking the log in its
+# cross-entropy; the per-dataset loss below does the same.
+KERAS_EPSILON = 1e-7
 
 
 def log_progress(message: str) -> None:
@@ -105,9 +111,11 @@ class LoggingFedAvg(fl.server.strategy.FedAvg):
     def aggregate_fit(self, server_round, results, failures):
         for client, fit_res in results:
             name = fit_res.metrics.get("client_name", client.cid)
+            fit_seconds = fit_res.metrics.get("fit_seconds")
+            fit_time = "" if fit_seconds is None else f", fit_time={format_duration(fit_seconds)}"
             log_progress(
                 f"[ROUND {server_round}] fit OK from {name} "
-                f"(num_examples={fit_res.num_examples})"
+                f"(num_examples={fit_res.num_examples}{fit_time})"
             )
         _stop_if_any_failure("fit", server_round, failures)
         log_progress(f"[ROUND {server_round}] fit round done: {len(results)} ok")
@@ -131,43 +139,167 @@ class LoggingFedAvg(fl.server.strategy.FedAvg):
 
 
 # One module per Raspberry Pi client; the server pools each dataset's
-# held-out test split into one combined evaluation set every round.
-DATASET_MODULES = [
-    carhacking_utils_cav,  # Pi1: HCRL Car-Hacking Dataset
-    otids_utils_cav,  # Pi2: HCRL CAN-intrusion-dataset (OTIDS)
-    survival_utils_cav,  # Pi3: HCRL Survival Analysis Dataset
-    ciciov_utils_cav,    # Pi4: CIC IoV Dataset 2024
-    road_utils_cav,      # Pi5: ROAD Dataset (ORNL)
-    canmirgu_utils_cav,  # Pi6: CAN-MIRGU
+# held-out test split into one combined evaluation set every round. The
+# names match each client's CLIENT_NAME.
+DATASETS = [
+    ("Pi1-carhacking", carhacking_utils_cav),  # HCRL Car-Hacking Dataset
+    ("Pi2-otids", otids_utils_cav),            # HCRL CAN-intrusion-dataset (OTIDS)
+    ("Pi3-survival", survival_utils_cav),      # HCRL Survival Analysis Dataset
+    ("Pi4-ciciov", ciciov_utils_cav),          # CIC IoV Dataset 2024
+    ("Pi5-road", road_utils_cav),              # ROAD Dataset (ORNL)
+    ("Pi6-canmirgu", canmirgu_utils_cav),      # CAN-MIRGU
 ]
+DATASET_MODULES = [module for _, module in DATASETS]
 
 
-def get_evaluate_fn(model, x_test, y_test):
-    labels = [0, 1]
+def _weighted_prf(cm):
+    """Weighted precision/recall/F1 from the 2x2 confusion matrix, with the
+    same definitions as sklearn's average="weighted", zero_division=0."""
+    tp = np.diag(cm).astype(np.float64)
+    pred = cm.sum(axis=0).astype(np.float64)
+    true = cm.sum(axis=1).astype(np.float64)
+    precision = np.divide(tp, pred, out=np.zeros(2), where=pred > 0)
+    recall = np.divide(tp, true, out=np.zeros(2), where=true > 0)
+    f1 = np.divide(2 * tp, true + pred, out=np.zeros(2), where=(true + pred) > 0)
+    return (
+        np.average(precision, weights=true),
+        np.average(recall, weights=true),
+        np.average(f1, weights=true),
+    )
+
+
+def _mcc(cm):
+    """sklearn's matthews_corrcoef formula, applied to the confusion matrix."""
+    t_sum = cm.sum(axis=1, dtype=np.float64)
+    p_sum = cm.sum(axis=0, dtype=np.float64)
+    n_correct = np.trace(cm, dtype=np.float64)
+    n_samples = p_sum.sum()
+    cov_ytyp = n_correct * n_samples - np.dot(t_sum, p_sum)
+    cov_ypyp = n_samples ** 2 - np.dot(p_sum, p_sum)
+    cov_ytyt = n_samples ** 2 - np.dot(t_sum, t_sum)
+    if cov_ypyp * cov_ytyt == 0:
+        return 0.0
+    return float(cov_ytyp / np.sqrt(cov_ypyp * cov_ytyt))
+
+
+def _roc_auc(y_true, scores):
+    """ROC AUC as the Mann-Whitney statistic (a tied attack/normal pair counts
+    1/2). Equals sklearn's roc_auc_score without its full-size copies. NaN
+    when only one class is present, where sklearn raises instead."""
+    pos = scores[y_true]
+    neg = scores[~y_true]
+    if len(pos) == 0 or len(neg) == 0:
+        return float("nan")
+    neg.sort()
+    below = int(np.searchsorted(neg, pos, side="left").sum())
+    ties = int(np.searchsorted(neg, pos, side="right").sum()) - below
+    return (2 * below + ties) / (2 * len(pos) * len(neg))
+
+
+def _binary_metrics(y_true, y_pred, p_attack):
+    """Metrics of one set of rows. Binary convention is fixed by
+    common_cav.LABEL_TO_INT: 0 = Normal, 1 = Attack."""
+    n = len(y_true)
+    tp = np.count_nonzero(y_true & y_pred)
+    fn = np.count_nonzero(y_true) - tp
+    fp = np.count_nonzero(y_pred) - tp
+    tn = n - tp - fn - fp
+    cm = np.array([[tn, fp], [fn, tp]], dtype=np.int64)
+
+    precision, recall, f1 = _weighted_prf(cm)
+    metrics = {
+        "accuracy": (tp + tn) / n,
+        "precision": precision,
+        "recall": recall,
+        "f1_score": f1,
+        "detection_rate": tp / (tp + fn) if (tp + fn) > 0 else 0.0,
+        "fpr": fp / (fp + tn) if (fp + tn) > 0 else 0.0,
+        "fnr": fn / (fn + tp) if (fn + tp) > 0 else 0.0,
+        "roc_auc": _roc_auc(y_true, p_attack),
+        "mcc": _mcc(cm),
+    }
+    return metrics, cm
+
+
+def _record_dataset_metrics(server_round, dataset_names, dataset_rows, y_true, y_pred, p_attack, loss_sums):
+    """Global model's metrics on each dataset's own test rows, plus their
+    unweighted mean (macro_avg). The pooled numbers in round_metrics.csv are
+    dominated by the largest test sets (ROAD, Car-Hacking); these show each
+    dataset on its own."""
+    rows = []
+    start = 0
+    for name, count, loss_sum in zip(dataset_names, dataset_rows, loss_sums):
+        end = start + count
+        metrics, cm = _binary_metrics(y_true[start:end], y_pred[start:end], p_attack[start:end])
+        (tn, fp), (fn, tp) = cm.tolist()
+        rows.append({
+            "round": server_round,
+            "dataset": name,
+            "num_examples": count,
+            "attack_examples": fn + tp,
+            "loss": loss_sum / count,
+            **metrics,
+            "tn": tn, "fp": fp, "fn": fn, "tp": tp,
+        })
+        start = end
+
+    table = pd.DataFrame(rows)
+    count_columns = ["num_examples", "attack_examples", "tn", "fp", "fn", "tp"]
+    # Rates are the unweighted mean over datasets; counts are the totals.
+    macro = {"round": server_round, "dataset": "macro_avg"}
+    macro.update(table[count_columns].sum().to_dict())
+    macro.update(table[["loss"] + list(metrics)].mean().to_dict())
+    table = pd.concat([table, pd.DataFrame([macro])], ignore_index=True)
+
+    print(f"Round {server_round} per-dataset metrics:")
+    print(table[["dataset", "num_examples", "accuracy", "f1_score", "detection_rate", "fpr", "roc_auc"]].to_string(index=False))
+    table.to_csv(
+        DATASET_METRICS_CSV,
+        mode="a",
+        header=not os.path.exists(DATASET_METRICS_CSV),
+        index=False,
+    )
+
+
+def get_evaluate_fn(model, x_test, y_test, dataset_names, dataset_rows):
+    n = len(y_test)
+    y_true = y_test.astype(bool)
+    # Which dataset each test row came from (the test sets are concatenated
+    # in DATASETS order).
+    dataset_id = np.repeat(np.arange(len(dataset_rows), dtype=np.int8), dataset_rows)
 
     def evaluate(server_round, parameters, config):
         t_start = time.time()
         model.set_weights(parameters)
-        loss, _ = model.evaluate(x_test, y_test, verbose=0)
 
-        y_pred_proba = model.predict(x_test, verbose=0)
-        y_pred = y_pred_proba.argmax(axis=1)
+        # Chunked: one evaluate()/predict() call on the whole ~17.5M-row test
+        # set makes TensorFlow copy all of it into a single tensor, which ran
+        # the Jetson out of memory.
+        loss_sum = 0.0
+        dataset_loss_sums = np.zeros(len(dataset_rows))
+        p_attack = np.empty(n, dtype=np.float32)
+        y_pred = np.empty(n, dtype=bool)
+        for start in range(0, n, EVAL_CHUNK_ROWS):
+            end = min(start + EVAL_CHUNK_ROWS, n)
+            x_chunk = x_test[start:end]
+            y_chunk = y_test[start:end]
+            chunk_loss, _ = model.evaluate(x_chunk, y_chunk.astype(np.int64), verbose=0)
+            loss_sum += chunk_loss * (end - start)
+            proba = model.predict(x_chunk, verbose=0)
+            p_attack[start:end] = proba[:, 1]
+            y_pred[start:end] = proba[:, 1] > proba[:, 0]  # same as argmax(axis=1)
+            # Per-row cross-entropy, to split the loss by dataset.
+            p_true = np.where(y_chunk == 1, proba[:, 1], proba[:, 0])
+            row_loss = -np.log(np.clip(p_true, KERAS_EPSILON, 1 - KERAS_EPSILON))
+            dataset_loss_sums += np.bincount(
+                dataset_id[start:end], weights=row_loss, minlength=len(dataset_rows),
+            )
+        loss = loss_sum / n
 
-        accuracy = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred, average="weighted", zero_division=0)
-        recall = recall_score(y_test, y_pred, average="weighted", zero_division=0)
-        f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
-        detection_rate = recall_score(y_test, y_pred, pos_label=1, zero_division=0)
-        mcc = matthews_corrcoef(y_test, y_pred)
-        roc_auc = roc_auc_score(y_test, y_pred_proba[:, 1])
-        cm = confusion_matrix(y_test, y_pred, labels=labels)
-
-        # Binary convention is fixed by common_cav.LABEL_TO_INT: 0 = Normal, 1 = Attack.
-        tn, fp = cm[0, 0], cm[0, 1]
-        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-
-        fn, tp = cm[1, 0], cm[1, 1]
-        fnr = fn / (fn + tp) if (fn + tp) > 0 else 0.0
+        global_metrics, cm = _binary_metrics(y_true, y_pred, p_attack)
+        _record_dataset_metrics(
+            server_round, dataset_names, dataset_rows, y_true, y_pred, p_attack, dataset_loss_sums,
+        )
 
         elapsed = time.time() - t_start
 
@@ -177,24 +309,9 @@ def get_evaluate_fn(model, x_test, y_test):
         print(f"Round {server_round} confusion matrix:")
         print(cm_df.to_string())
 
-        metrics_row = pd.DataFrame(
-            [
-                {
-                    "round": server_round,
-                    "loss": loss,
-                    "accuracy": accuracy,
-                    "precision": precision,
-                    "recall": recall,
-                    "f1_score": f1,
-                    "detection_rate": detection_rate,
-                    "fpr": fpr,
-                    "fnr": fnr,
-                    "roc_auc": roc_auc,
-                    "mcc": mcc,
-                    "elapsed_sec": elapsed,
-                }
-            ]
-        )
+        # Same column order as before, so rows still line up with an
+        # existing round_metrics.csv.
+        metrics_row = pd.DataFrame([{"round": server_round, "loss": loss, **global_metrics, "elapsed_sec": elapsed}])
         metrics_row.to_csv(
             ROUND_METRICS_CSV,
             mode="a",
@@ -202,51 +319,66 @@ def get_evaluate_fn(model, x_test, y_test):
             index=False,
         )
 
-        return loss, {
-            "accuracy": accuracy,
-            "precision": precision,
-            "recall": recall,
-            "f1_score": f1,
-            "detection_rate": detection_rate,
-            "fpr": fpr,
-            "fnr": fnr,
-            "roc_auc": roc_auc,
-            "mcc": mcc,
-            "elapsed_sec": elapsed,
-        }
+        return loss, {**global_metrics, "elapsed_sec": elapsed}
 
     return evaluate
 
 
-def report_cache_status(dataset_module):
+def _cache_matches(dataset_module):
     pattern = os.path.join(
         dataset_module.BASE_DIR, "split_cache",
         f"{dataset_module.DATASET_KEY}_ts{TEST_SIZE}_rs{RANDOM_STATE}_src*.npz",
     )
-    if glob.glob(pattern):
+    return sorted(glob.glob(pattern))
+
+
+def report_cache_status(dataset_module):
+    if _cache_matches(dataset_module):
         print(f"[CACHE] {dataset_module.DATASET_KEY}: found split_cache, no raw data download needed", flush=True)
     else:
         print(f"[CACHE] {dataset_module.DATASET_KEY}: NO split_cache found, raw data will be downloaded/processed", flush=True)
 
 
+def load_test_split(dataset_module):
+    """Only x_test/y_test from the cache: an .npz reads members on access, so
+    the much larger x_train is never loaded on the server."""
+    matches = _cache_matches(dataset_module)
+    if not matches:
+        return dataset_module.get_test_split(test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    with np.load(matches[0]) as data:
+        return data["x_test"], data["y_test"]
+
+
 x_test_parts = []
 y_test_parts = []
-for dataset_module in DATASET_MODULES:
+dataset_names = []
+dataset_rows = []
+for dataset_name, dataset_module in DATASETS:
     report_cache_status(dataset_module)
-    x_part, y_part = dataset_module.get_test_split(
-        test_size=TEST_SIZE,
-        random_state=RANDOM_STATE,
-    )
+    x_part, y_part = load_test_split(dataset_module)
     x_test_parts.append(x_part)
     y_test_parts.append(y_part)
+    dataset_names.append(dataset_name)
+    dataset_rows.append(len(y_part))
+    print(f"[DATA] {dataset_name}: {len(y_part)} test rows", flush=True)
 
 x_test = np.concatenate(x_test_parts)
-y_test = np.concatenate(y_test_parts)
+y_test = np.concatenate(y_test_parts).astype(np.int8)
+# Drop the per-dataset copies; otherwise the test set sits in memory twice.
+del x_test_parts, y_test_parts, x_part, y_part
 x_test = common_cav.reshape_for_cnn(x_test)
+
+def round_config(server_round):
+    """Sent to every Pi with each fit/evaluate request, so its progress lines
+    can say which round they belong to."""
+    return {"server_round": server_round, "num_rounds": NUM_ROUNDS}
+
 
 model = build_model((x_test.shape[1], x_test.shape[2]))
 strategy = LoggingFedAvg(
-    evaluate_fn=get_evaluate_fn(model, x_test, y_test),
+    evaluate_fn=get_evaluate_fn(model, x_test, y_test, dataset_names, dataset_rows),
+    on_fit_config_fn=round_config,
+    on_evaluate_config_fn=round_config,
     min_fit_clients=len(DATASET_MODULES),
     min_evaluate_clients=len(DATASET_MODULES),
     min_available_clients=len(DATASET_MODULES),
@@ -254,6 +386,6 @@ strategy = LoggingFedAvg(
 
 fl.server.start_server(
     server_address="0.0.0.0:3040",
-    config=fl.server.ServerConfig(num_rounds=3, round_timeout=ROUND_TIMEOUT_SEC),
+    config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS, round_timeout=ROUND_TIMEOUT_SEC),
     strategy=strategy,
 )

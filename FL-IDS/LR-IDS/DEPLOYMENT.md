@@ -32,7 +32,7 @@ All datasets already have their raw files downloaded and cached in this repo's w
 
 ## Commands to run
 
-Replace `<JETSON_IP>` with the Jetson Xavier's actual LAN IP address. The client scripts default to `192.168.137.68:3040` (a common USB-tether/ICS subnet address) — if that's not the Jetson's real address on your network, pass `--server-address` explicitly as shown.
+Replace `<JETSON_IP>` with the Jetson Xavier's actual LAN IP address. The client scripts default to `192.168.137.250:3040` (a common USB-tether/ICS subnet address) — if that's not the Jetson's real address on your network, pass `--server-address` explicitly as shown.
 
 **On the Jetson Xavier (start this first — it waits for all 6 clients before training begins):**
 ```bash
