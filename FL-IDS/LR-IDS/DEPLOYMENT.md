@@ -32,6 +32,8 @@ Every dataset is labeled per frame (Pi1/Pi3: the dataset's R/T flag; Pi2: inject
 
 Build the caches once on a PC with the raw data (`PiN/split_cache/*.npz`) and copy them with the code; a client or the server only falls back to the raw files (and their auto-download) when no cache with the current `DATASET_KEY` exists.
 
+Class balance (`common_cav.Sampling`): every client gets the same number of training rows (`TRAIN_ROWS_PER_CLIENT`, interim 600,000, including its local validation split), with all of its attack frames up to 20% of them and normal frames filling the rest; FedAvg weights clients by row count, so equal sizes keep any one dataset from dominating. Test sets keep every attack frame and at most 2,000,000 normal frames per dataset, uniformly sampled; each kept normal row carries a weight (`w_test`) so that weighted metrics estimate the full test set. Rows are sampled after the features are computed, so the time features always see every frame.
+
 ## Commands to run
 
 Replace `<JETSON_IP>` with the Jetson Xavier's actual LAN IP address. The client scripts default to `192.168.137.250:3040` (a common USB-tether/ICS subnet address) — if that's not the Jetson's real address on your network, pass `--server-address` explicitly as shown.
@@ -76,7 +78,7 @@ Each Pi also accepts `--client-id <n>` purely as a log label (defaults are alrea
 
 - `Server/round_metrics.csv` — one row per round: accuracy, precision, recall, F1, detection_rate, FPR, FNR, ROC-AUC, MCC, elapsed_sec.
 - `Server/confusion_matrix_round_<N>.xlsx` — confusion matrix for that round's global model.
-- `Server/generalization_metrics.csv` / `generalization_files.csv` — written once, after the last round: the final model on sets no client trains on (Pi4's can-train-and-test: Forester unseen attacks `test_03` without `double-1`; the 2011 Chevrolet Traverse `test_02` known attacks and `test_04` unseen attacks). Each set at threshold 0.5; the Traverse sets also at thresholds set from the Traverse's own attack-free recording for 1% / 0.1% FPR (no labels). Per capture (= attack type) in the `_files` CSV. Needs `Pi4/split_cache/cantt04_gen_h12_*.npz` on the Jetson; without it the server says so at startup and skips this step. These numbers are kept out of `round_metrics.csv` and `dataset_metrics.csv`.
+- `Server/generalization_metrics.csv` / `generalization_files.csv` — written once, after the last round: the final model on sets no client trains on (Pi4's can-train-and-test: Forester unseen attacks `test_03` without `double-1`; the 2011 Chevrolet Traverse `test_02` known attacks and `test_04` unseen attacks). Each set at threshold 0.5; the Traverse sets also at thresholds set from the Traverse's own attack-free recording for 1% / 0.1% FPR (no labels). Per capture (= attack type) in the `_files` CSV. Needs `Pi4/split_cache/cantt04_gen_h12_s1_*.npz` on the Jetson; without it the server says so at startup and skips this step. These numbers are kept out of `round_metrics.csv` and `dataset_metrics.csv`.
 - 3 rounds run by default (`num_rounds=3` in `server_cav.py`).
 
 ## Requirements
@@ -85,5 +87,5 @@ Each machine (Jetson + every Pi) needs: `flwr`, `tensorflow`, `numpy`, `pandas`,
 
 ## Known caveats before relying on this in production
 
-- **Raspberry Pi RAM**: building a split from raw data needs far more than 1GB (CAN-MIRGU reads ~118M frames). Build the caches on a PC; a Pi only streams its `CLIENT_TRAIN_FRACTION` of the cached training pool.
+- **Raspberry Pi RAM**: building a split from raw data needs far more than 1GB (CAN-MIRGU reads ~118M frames). Build the caches on a PC; a Pi only reads the training rows of its cache (600,000 rows by default), never the test rows.
 - **`flwr.server.start_server()` is deprecated** in the installed Flower version (1.39) in favor of the `flower-superlink` CLI. It still works today but may be removed in a future Flower release.

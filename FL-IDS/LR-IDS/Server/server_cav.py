@@ -290,7 +290,9 @@ def evaluate_generalization(model, server_round):
     log_progress(f"generalization evaluation of round {server_round} model started")
     t_start = time.time()
     set_rows, file_rows = [], []
-    for name, x, y, file_index, file_names, x_cal in cantt_utils_cav.iter_generalization_sets(TEST_SIZE, RANDOM_STATE):
+    # Row weights (capped test normals) are not applied to these metrics yet;
+    # detection rate, FPR and AUC do not need them.
+    for name, x, y, _weights, file_index, file_names, x_cal in cantt_utils_cav.iter_generalization_sets(TEST_SIZE, RANDOM_STATE):
         y_true = y.astype(bool)
         p = _predict_attack(model, x)
         rules = [("default", 0.5, None)]

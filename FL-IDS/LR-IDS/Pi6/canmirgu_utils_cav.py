@@ -70,11 +70,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CANMIRGU_DIR = os.path.join(BASE_DIR, "CAN-MIRGU")
 # Renamed whenever the rows, labels or features change: a cache is found by
 # this key alone, so an old cache would otherwise keep being used.
-DATASET_KEY = "canmirgu_h12s"
+DATASET_KEY = "canmirgu_h12s_s1"
 BENIGN_TEST_DAYS = ("Day_2", "Day_4", "Day_6")
-# Fraction of the ~4.2M-row training pool this client actually trains on.
-# Sized so the client fits in a 1GB Raspberry Pi; the test split is unchanged.
-CLIENT_TRAIN_FRACTION = 0.40
 UCI_ZIP_URL = "https://archive.ics.uci.edu/static/public/1035/can-mirgu.zip"
 SOURCE_URLS = (
     "https://archive.ics.uci.edu/dataset/1035/can-mirgu",
@@ -93,11 +90,9 @@ BENIGN_FOLDER = "Benign"
 REAL_ATTACK_FOLDER = "Real_attacks"
 EXCLUDED_ATTACK_FOLDERS = ("Masquerade_attacks", "Suspension_attacks")
 
-# The used captures hold ~118M frames, far more than the other datasets. Every
-# frame is read (the time-since-previous-frame features need all of them),
-# then 5% of the rows are kept, the same share the earlier 1-in-20 line
-# sampling kept. Interim: to be set when class imbalance is handled.
-SAMPLING = common_cav.RowSampling(train_normal=0.05, train_attack=0.05, test=0.05)
+# The used captures hold ~118M frames. Every frame is read (the time features
+# need all of them); rows are then sampled as for every dataset.
+SAMPLING = common_cav.Sampling()
 
 reshape_for_cnn = common_cav.reshape_for_cnn
 
@@ -223,22 +218,22 @@ def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41)
 
     files = _ensure_raw_files()
     source_version = common_cav.directory_signature(files)
-    x_train, x_test, y_train, y_test, tables = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
-    return common_cav.cache_precomputed_split(
-        DATASET_KEY, BASE_DIR, x_train, x_test, y_train, y_test,
-        source_version, test_size, random_state, common_cav.period_table_arrays(tables),
+    split = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
+    return common_cav.cache_split(
+        DATASET_KEY, BASE_DIR, split, source_version, test_size, random_state,
+        common_cav.period_table_arrays(split.tables),
     )
 
 
 def get_client_data(test_size: float = 0.33, random_state: int = 41, local_val_size: float = 0.2):
-    pool = common_cav.load_cached_train_fraction(
-        DATASET_KEY, BASE_DIR, CLIENT_TRAIN_FRACTION, test_size, random_state,
-    )
-    if pool is None:
-        x_full, _, y_full, _ = get_global_train_test_split(test_size, random_state)
-        pool = common_cav.subsample_rows(x_full, y_full, CLIENT_TRAIN_FRACTION, random_state)
-    x_train_pool, y_train_pool = pool
-    return common_cav.local_train_val_split(x_train_pool, y_train_pool, local_val_size, random_state)
+    """The client's training rows (already sampled to their final size when
+    the cache was built), split into local train / validation."""
+    cached = common_cav.load_cached(DATASET_KEY, BASE_DIR, ("x_train", "y_train"), test_size, random_state)
+    if cached is None:
+        x_train, _, y_train, _ = get_global_train_test_split(test_size, random_state)
+    else:
+        x_train, y_train = cached
+    return common_cav.local_train_val_split(x_train, y_train, local_val_size, random_state)
 
 
 def get_test_split(test_size: float = 0.33, random_state: int = 41):

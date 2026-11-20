@@ -53,11 +53,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CANTT_DIR = os.path.join(BASE_DIR, "can-train-and-test")
 # New key whenever the rows, labels or features change: caches are found by
 # key alone (see common_cav.find_any_cached_split), so an old one would be reused.
-DATASET_KEY = "cantt04_h12"
-# Fraction of the ~9.5M-row training pool this client trains on (test split
-# is never sampled). Interim: to be set when class imbalance is handled.
-CLIENT_TRAIN_FRACTION = 0.15
-SAMPLING = common_cav.RowSampling()
+DATASET_KEY = "cantt04_h12_s1"
+SAMPLING = common_cav.Sampling()
 SOURCE_URL = "https://bitbucket.org/brooke-lampe/can-train-and-test"
 API_FILE_URL = "https://api.bitbucket.org/2.0/repositories/brooke-lampe/can-train-and-test/src/master/{path}"
 
@@ -114,7 +111,7 @@ DOWNLOAD_ATTEMPTS = 5
 #   only set_02/train_01 attack-free-1/2: accessory-1/2 there are the base
 #   traffic of the test_02 accessory attack captures.
 # - test_03 double-1 is dropped: its base traffic is train_01 systematic-4.
-GEN_DATASET_KEY = "cantt04_gen_h12"
+GEN_DATASET_KEY = "cantt04_gen_h12_s1"
 TRAVERSE_CAL_DIR = "set_02/train_01"
 FORESTER_UNKNOWN_DIR = "set_04/test_03_known_vehicle_unknown_attack"
 TRAVERSE_KNOWN_DIR = "set_04/test_02_unknown_vehicle_known_attack"
@@ -238,22 +235,22 @@ def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41)
 
     files = _ensure_raw_files()
     source_version = common_cav.directory_signature(files)
-    x_train, x_test, y_train, y_test, tables = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
-    return common_cav.cache_precomputed_split(
-        DATASET_KEY, BASE_DIR, x_train, x_test, y_train, y_test,
-        source_version, test_size, random_state, common_cav.period_table_arrays(tables),
+    split = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
+    return common_cav.cache_split(
+        DATASET_KEY, BASE_DIR, split, source_version, test_size, random_state,
+        common_cav.period_table_arrays(split.tables),
     )
 
 
 def get_client_data(test_size: float = 0.33, random_state: int = 41, local_val_size: float = 0.2):
-    pool = common_cav.load_cached_train_fraction(
-        DATASET_KEY, BASE_DIR, CLIENT_TRAIN_FRACTION, test_size, random_state,
-    )
-    if pool is None:
-        x_full, _, y_full, _ = get_global_train_test_split(test_size, random_state)
-        pool = common_cav.subsample_rows(x_full, y_full, CLIENT_TRAIN_FRACTION, random_state)
-    x_train_pool, y_train_pool = pool
-    return common_cav.local_train_val_split(x_train_pool, y_train_pool, local_val_size, random_state)
+    """The client's training rows (already sampled to their final size when
+    the cache was built), split into local train / validation."""
+    cached = common_cav.load_cached(DATASET_KEY, BASE_DIR, ("x_train", "y_train"), test_size, random_state)
+    if cached is None:
+        x_train, _, y_train, _ = get_global_train_test_split(test_size, random_state)
+    else:
+        x_train, y_train = cached
+    return common_cav.local_train_val_split(x_train, y_train, local_val_size, random_state)
 
 
 def get_test_split(test_size: float = 0.33, random_state: int = 41):
@@ -307,10 +304,14 @@ def _build_generalization_cache(test_size: float, random_state: int) -> str:
     source_version = common_cav.directory_signature(_ensure_raw_files(all_files))
 
     arrays = {"set_names": np.array(list(GEN_FILES), dtype=str)}
+    # Calibration rows ("train") are all kept; test normals are capped as for
+    # the main test sets, with weights.
+    sampling = common_cav.Sampling(train_rows=None)
     for set_name in GEN_FILES:
         captures = _gen_captures(set_name)
-        x_cal, x_test, _, y_test, tables, test_capture = common_cav.build_feature_split(
-            captures, common_cav.RowSampling(), random_state, return_test_capture=True)
+        split = common_cav.build_feature_split(captures, sampling, random_state)
+        x_cal, x_test, y_test, tables, test_capture = split.x_train, split.x_test, split.y_test, split.tables, split.test_capture
+        arrays[f"w_{set_name}"] = split.w_test
         if GEN_SET_VEHICLE[set_name] == "forester":
             scaler = forester_scaler
             arrays[f"calibration_{set_name}"] = np.array("")
@@ -326,7 +327,7 @@ def _build_generalization_cache(test_size: float, random_state: int) -> str:
         arrays[f"files_{set_name}"] = np.array([c.name.split("/", 1)[1] for c in captures[first_test:]], dtype=str)
         for key, value in common_cav.period_table_arrays(tables).items():
             arrays[f"{key}_{set_name}"] = value
-        del x_cal, x_test
+        del split, x_cal, x_test
 
     cache_dir = os.path.join(BASE_DIR, "split_cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -337,14 +338,16 @@ def _build_generalization_cache(test_size: float, random_state: int) -> str:
 
 def iter_generalization_sets(test_size: float = 0.33, random_state: int = 41):
     """Yield one generalization set at a time (to keep server memory low):
-    ``(name, x, y, file_index, file_names, x_calibration)``; ``x_calibration``
-    is the new vehicle's scaled attack-free traffic for threshold
-    calibration, or None for the known vehicle."""
+    ``(name, x, y, weights, file_index, file_names, x_calibration)``;
+    ``weights`` is how many rows each row stands for (test normals are
+    capped, see common_cav.Sampling); ``x_calibration`` is the new vehicle's
+    scaled attack-free traffic for threshold calibration, or None for the
+    known vehicle."""
     path = common_cav.cached_split_path(GEN_DATASET_KEY, BASE_DIR, test_size, random_state)
     if path is None:
         path = _build_generalization_cache(test_size, random_state)
     with np.load(path) as data:
         for name in data["set_names"].tolist():
             calibration = str(data[f"calibration_{name}"])
-            yield (name, data[f"x_{name}"], data[f"y_{name}"], data[f"file_{name}"],
+            yield (name, data[f"x_{name}"], data[f"y_{name}"], data[f"w_{name}"], data[f"file_{name}"],
                    data[f"files_{name}"].tolist(), data[f"x_{calibration}"] if calibration else None)

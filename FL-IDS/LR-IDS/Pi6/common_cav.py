@@ -44,10 +44,9 @@ import os
 import re
 import urllib.parse
 import urllib.request
-import zipfile
 
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -257,13 +256,41 @@ class Capture:
     group: str = "vehicle"
 
 
+# Class balance (see Sampling). Every client gets the same number of training
+# rows, so FedAvg (which weights clients by row count) treats them alike and
+# no Pi is much slower than the others. Interim value: fixed after the model
+# review, since it sets the round time on the Pis.
+TRAIN_ROWS_PER_CLIENT = 600_000
+TRAIN_ATTACK_SHARE_MAX = 0.20
+TEST_NORMALS_MAX = 2_000_000
+
+
 @dataclass
-class RowSampling:
-    """Fraction of rows kept, drawn after the features are computed:
-    train normal rows, train attack rows, and test rows (any label)."""
-    train_normal: float = 1.0
-    train_attack: float = 1.0
-    test: float = 1.0
+class Sampling:
+    """Which rows a dataset keeps, drawn uniformly at random after the
+    features are computed (so time features always see every frame):
+
+    - train: every attack row up to ``train_attack_share_max`` of
+      ``train_rows``, then normal rows up to ``train_rows`` in total.
+      ``train_rows=None`` keeps every train row.
+    - test: every attack row, and at most ``test_normals_max`` normal rows
+      (None: all). Kept test normals get weight total/kept, so weighted
+      metrics estimate the full test set.
+    """
+    train_rows: Optional[int] = TRAIN_ROWS_PER_CLIENT
+    train_attack_share_max: float = TRAIN_ATTACK_SHARE_MAX
+    test_normals_max: Optional[int] = TEST_NORMALS_MAX
+
+
+@dataclass
+class FeatureSplit:
+    x_train: np.ndarray
+    y_train: np.ndarray
+    x_test: np.ndarray
+    y_test: np.ndarray
+    w_test: np.ndarray       # per test row: how many test rows it stands for
+    tables: dict             # {vehicle group: PeriodTable}
+    test_capture: np.ndarray  # per test row: index of its capture in the input list
 
 
 def time_block_layout(n_rows: int):
@@ -386,15 +413,48 @@ def _features(dlc, data, dt, bits, period):
     ]).astype(np.float32)
 
 
-def build_feature_split(captures: Iterable[Capture], sampling: RowSampling, random_state: int = 41, log=print,
-                        return_test_capture: bool = False):
+TRAIN_NORMAL, TRAIN_ATTACK, TEST_NORMAL, TEST_ATTACK = 0, 1, 2, 3
+POOL_NAMES = ("train normal", "train attack", "test normal", "test attack")
+
+
+def _pool_caps(sampling: Sampling) -> list:
+    """Upper bound of rows kept per pool while streaming (None = all)."""
+    if sampling.train_rows is None:
+        train_normal = train_attack = None
+    else:
+        train_attack = int(sampling.train_rows * sampling.train_attack_share_max)
+        train_normal = sampling.train_rows
+    return [train_normal, train_attack, sampling.test_normals_max, None]
+
+
+def _prune(kept: list, thresholds: np.ndarray) -> None:
+    """Drop kept rows whose random key is above their pool's threshold."""
+    for part in kept:
+        mask = part["key"] <= thresholds[part["pool"]]
+        if not mask.all():
+            for name in list(part):
+                if isinstance(part[name], np.ndarray):
+                    part[name] = part[name][mask]
+
+
+def _kth_key(kept: list, pool: int, k: int) -> float:
+    keys = np.concatenate([part["key"][part["pool"] == pool] for part in kept])
+    return float(np.partition(keys, k - 1)[k - 1]) if len(keys) > k else np.inf
+
+
+def build_feature_split(captures: Iterable[Capture], sampling: Sampling, random_state: int = 41,
+                        log=print) -> FeatureSplit:
     """Load every capture once, compute the 12 features, sample rows.
 
-    Returns ``(x_train, x_test, y_train, y_test, period_tables)`` with
-    ``period_tables`` a {group: PeriodTable} dict; with
-    ``return_test_capture`` also, per test row, the index of its capture in
-    ``captures``.
+    Rows are drawn per pool (train normal / train attack / test normal /
+    test attack) as a uniform random sample of the whole dataset: each row
+    gets a random key and a pool keeps its rows with the smallest keys, so
+    the result does not depend on capture order or size, and memory stays
+    bounded by the pool sizes.
     """
+    caps = _pool_caps(sampling)
+    thresholds = np.full(4, np.inf)
+    totals = np.zeros(4, dtype=np.int64)
     kept = []
     baseline_parts = {}
     for index, capture in enumerate(captures):
@@ -419,46 +479,70 @@ def build_feature_split(captures: Iterable[Capture], sampling: RowSampling, rand
             baseline_parts.setdefault(capture.group, []).append(
                 (stream[usable], dt[usable].astype(np.float32)))
 
-        rng = np.random.default_rng([random_state, index])
-        u = rng.random(n)
         attack = frames.y == 1
-        keep = (
-            (train & ~attack & (u < sampling.train_normal))
-            | (train & attack & (u < sampling.train_attack))
-            | (test & (u < sampling.test))
-        )
+        pool = np.full(n, -1, dtype=np.int8)
+        pool[train & ~attack] = TRAIN_NORMAL
+        pool[train & attack] = TRAIN_ATTACK
+        pool[test & ~attack] = TEST_NORMAL
+        pool[test & attack] = TEST_ATTACK
+        totals += np.bincount(pool[pool >= 0], minlength=4)
+        key = np.random.default_rng([random_state, index]).random(n)
+        keep = (pool >= 0) & (key <= thresholds[np.maximum(pool, 0)])
         kept.append({
-            "index": index, "group": capture.group, "train": train[keep], "stream": stream[keep],
-            "dlc": frames.dlc[keep], "data": frames.data[keep], "dt": dt[keep],
-            "bits": bits[keep], "y": frames.y[keep],
+            "index": index, "group": capture.group, "pool": pool[keep], "key": key[keep],
+            "stream": stream[keep], "dlc": frames.dlc[keep], "data": frames.data[keep],
+            "dt": dt[keep], "bits": bits[keep], "y": frames.y[keep],
         })
         replies = int((stream % FRAME_KINDS == REMOTE_REPLY).sum())
         log(f"[DATA] {capture.name}: {n} frames ({int(attack.sum())} attack, "
             f"{int(frames.rtr.sum())} remote, {replies} remote replies), "
-            f"{int(recording_gaps.sum())} recording gaps, "
-            f"kept {int((keep & train).sum())} train / {int((keep & test).sum())} test")
+            f"{int(recording_gaps.sum())} recording gaps, {int(train.sum())} train / {int(test.sum())} test rows")
         del frames, dt, bits
+        # Tighten each capped pool once it holds more than twice its cap.
+        for p, cap in enumerate(caps):
+            if cap is not None and sum(int((part["pool"] == p).sum()) for part in kept) > 2 * cap:
+                thresholds[p] = _kth_key(kept, p, cap)
+        _prune(kept, thresholds)
+
+    # Final sizes: attacks first, then normals fill the training rows.
+    for p in (TRAIN_ATTACK, TEST_NORMAL):
+        if caps[p] is not None:
+            thresholds[p] = _kth_key(kept, p, caps[p])
+    _prune(kept, thresholds)
+    if caps[TRAIN_NORMAL] is not None:
+        n_attack = sum(int((part["pool"] == TRAIN_ATTACK).sum()) for part in kept)
+        thresholds[TRAIN_NORMAL] = _kth_key(kept, TRAIN_NORMAL, caps[TRAIN_NORMAL] - n_attack)
+        _prune(kept, thresholds)
+    counts = np.array([sum(int((part["pool"] == p).sum()) for part in kept) for p in range(4)])
+    log("[SAMPLE] " + ", ".join(f"{POOL_NAMES[p]} {counts[p]}/{totals[p]}" for p in range(4)))
 
     tables = {group: _period_table(parts) for group, parts in baseline_parts.items()}
-    missing = {part["group"] for part in kept} - set(tables)
+    missing = {part["group"] for part in kept if len(part["y"])} - set(tables)
     if missing:
         raise ValueError(f"no attack-free capture for vehicle group(s) {sorted(missing)}")
 
-    x_train, x_test, y_train, y_test, test_capture = [], [], [], [], []
+    normal_weight = totals[TEST_NORMAL] / counts[TEST_NORMAL] if counts[TEST_NORMAL] else 1.0
+    x_train, x_test, y_train, y_test, w_test, test_capture = [], [], [], [], [], []
     for part in kept:
+        if not len(part["y"]):
+            continue
         x = _features(part["dlc"], part["data"], part["dt"], part["bits"], tables[part["group"]].lookup(part["stream"]))
-        x_train.append(x[part["train"]])
-        x_test.append(x[~part["train"]])
-        y_train.append(part["y"][part["train"]])
-        y_test.append(part["y"][~part["train"]])
-        test_capture.append(np.full(int((~part["train"]).sum()), part["index"], dtype=np.int16))
+        is_train = part["pool"] <= TRAIN_ATTACK
+        x_train.append(x[is_train]); y_train.append(part["y"][is_train])
+        x_test.append(x[~is_train]); y_test.append(part["y"][~is_train])
+        w_test.append(np.where(part["pool"][~is_train] == TEST_NORMAL, normal_weight, 1.0).astype(np.float32))
+        test_capture.append(np.full(int((~is_train).sum()), part["index"], dtype=np.int16))
     del kept
-    result = (
-        np.concatenate(x_train), np.concatenate(x_test),
-        np.concatenate(y_train).astype(np.int64), np.concatenate(y_test).astype(np.int64),
-        tables,
+    empty = np.zeros((0, NUM_FEATURES), dtype=np.float32)
+    return FeatureSplit(
+        x_train=np.concatenate(x_train) if x_train else empty,
+        y_train=np.concatenate(y_train).astype(np.int64) if y_train else np.zeros(0, np.int64),
+        x_test=np.concatenate(x_test) if x_test else empty,
+        y_test=np.concatenate(y_test).astype(np.int64) if y_test else np.zeros(0, np.int64),
+        w_test=np.concatenate(w_test) if w_test else np.zeros(0, np.float32),
+        tables=tables,
+        test_capture=np.concatenate(test_capture) if test_capture else np.zeros(0, np.int16),
     )
-    return result + (np.concatenate(test_capture),) if return_test_capture else result
 
 
 def period_table_arrays(tables: dict) -> dict:
@@ -484,25 +568,26 @@ def reshape_for_cnn(x: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------- caching
-def cache_precomputed_split(
+def cache_split(
     dataset_key: str,
     base_dir: str,
-    x_train: np.ndarray,
-    x_test: np.ndarray,
-    y_train: np.ndarray,
-    y_test: np.ndarray,
+    split: FeatureSplit,
     source_version: int,
     test_size: float = 0.33,
     random_state: int = 41,
     extra_arrays: dict = None,
 ):
-    """Scale a split whose train/test membership was decided by the caller
-    (e.g. time blocks or whole files) and cache it. The scaler is fit on the
-    train side only. ``extra_arrays`` (e.g. the ID period tables) are stored
-    alongside for reference; nothing reads them back at training time."""
-    scaler = StandardScaler().fit(x_train)
-    x_train = scaler.transform(x_train).astype(np.float32)
-    x_test = scaler.transform(x_test).astype(np.float32)
+    """Scale ``split`` with a scaler fit on its train rows only and cache it.
+
+    The file holds the client's training rows (``x_train``/``y_train``,
+    already sampled to its final size) and the server's test rows with
+    their weights (``x_test``/``y_test``/``w_test``). ``extra_arrays``
+    (e.g. the ID period tables) are stored alongside for reference.
+    Returns ``(x_train, x_test, y_train, y_test)`` scaled.
+    """
+    scaler = StandardScaler().fit(split.x_train)
+    x_train = scaler.transform(split.x_train).astype(np.float32)
+    x_test = scaler.transform(split.x_test).astype(np.float32)
 
     cache_dir = os.path.join(base_dir, "split_cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -511,10 +596,11 @@ def cache_precomputed_split(
         f"{dataset_key}_ts{test_size}_rs{random_state}_src{source_version}.npz",
     )
     np.savez(
-        cache_path, x_train=x_train, x_test=x_test, y_train=y_train, y_test=y_test,
+        cache_path, x_train=x_train, y_train=split.y_train, x_test=x_test, y_test=split.y_test,
+        w_test=split.w_test, test_capture=split.test_capture,
         scaler_mean=scaler.mean_, scaler_scale=scaler.scale_, **(extra_arrays or {}),
     )
-    return x_train, x_test, y_train, y_test
+    return x_train, x_test, split.y_train, split.y_test
 
 
 def directory_signature(paths: Iterable[str]) -> int:
@@ -530,118 +616,35 @@ def directory_signature(paths: Iterable[str]) -> int:
     return total
 
 
-def _read_exact(f, nbytes: int) -> bytes:
-    chunks = []
-    remaining = nbytes
-    while remaining:
-        data = f.read(remaining)
-        if not data:
-            raise EOFError("unexpected end of cached array data")
-        chunks.append(data)
-        remaining -= len(data)
-    return b"".join(chunks)
-
-
-def _iter_npy_rows(zf: zipfile.ZipFile, member: str, chunk_rows: int):
-    """Yield an ``.npy`` array stored inside an ``.npz`` in row chunks,
-    without loading the whole array into memory."""
-    with zf.open(member) as f:
-        version = np.lib.format.read_magic(f)
-        if version == (1, 0):
-            shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(f)
-        else:
-            shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(f)
-        if fortran_order:
-            raise ValueError(f"{member} is Fortran-ordered; expected row-major")
-        n_rows = shape[0]
-        row_shape = tuple(shape[1:])
-        row_bytes = int(np.prod(row_shape, dtype=np.int64)) * dtype.itemsize
-        done = 0
-        while done < n_rows:
-            take = min(chunk_rows, n_rows - done)
-            buf = _read_exact(f, take * row_bytes)
-            yield np.frombuffer(buf, dtype=dtype).reshape((take,) + row_shape)
-            done += take
-
-
-def load_cached_train_fraction(
-    dataset_key: str,
-    base_dir: str,
-    fraction: float,
-    test_size: float = 0.33,
-    random_state: int = 41,
-    chunk_rows: int = 1_000_000,
-):
-    """Return a uniform random ``fraction`` of the cached training pool,
-    reading only ``x_train``/``y_train`` and streaming in chunks so the full
-    pool (and the test arrays) never sit in memory at once.
-
-    Every row is kept with the same probability, so each class keeps
-    (in expectation) its original share -- stratified sampling in effect.
-    Returns ``None`` if no cache file exists for this dataset.
-    """
-    pattern = os.path.join(
-        base_dir, "split_cache",
-        f"{dataset_key}_ts{test_size}_rs{random_state}_src*.npz",
-    )
-    matches = sorted(glob.glob(pattern))
-    if not matches:
-        return None
-
-    rng = np.random.default_rng(random_state)
-    x_parts = []
-    y_parts = []
-    with zipfile.ZipFile(matches[0]) as zf:
-        x_chunks = _iter_npy_rows(zf, "x_train.npy", chunk_rows)
-        y_chunks = _iter_npy_rows(zf, "y_train.npy", chunk_rows)
-        for x_chunk, y_chunk in zip(x_chunks, y_chunks):
-            keep = rng.random(len(x_chunk)) < fraction
-            x_parts.append(x_chunk[keep])
-            y_parts.append(y_chunk[keep])
-    return np.concatenate(x_parts), np.concatenate(y_parts)
-
-
-def subsample_rows(x: np.ndarray, y: np.ndarray, fraction: float, random_state: int = 41):
-    """Same uniform-rate subsampling as ``load_cached_train_fraction``, for
-    data that is already fully in memory (fallback when no cache exists)."""
-    rng = np.random.default_rng(random_state)
-    keep = rng.random(len(x)) < fraction
-    return x[keep], y[keep]
-
-
 def cached_split_path(dataset_key: str, base_dir: str, test_size: float = 0.33, random_state: int = 41):
-    """Path of the cached split for ``dataset_key`` (any source version), or None."""
+    """Path of the cached split for ``dataset_key``, or None.
+
+    The cache filename carries a ``source_version`` signature computed from
+    the raw files' mtimes; recomputing it would require the (often multi-GB)
+    raw dataset just to find the cache, which is pointless on a Pi or the
+    Jetson that only has ``split_cache/*.npz`` copied onto it. Any source
+    suffix matches -- so ``dataset_key`` must change whenever the rows,
+    labels, features or sampling change.
+    """
     pattern = os.path.join(base_dir, "split_cache", f"{dataset_key}_ts{test_size}_rs{random_state}_src*.npz")
     matches = sorted(glob.glob(pattern))
     return matches[0] if matches else None
 
 
-def find_any_cached_split(
-    dataset_key: str,
-    base_dir: str,
-    test_size: float = 0.33,
-    random_state: int = 41,
-):
-    """Load a cached split for ``dataset_key`` if one exists, regardless of
-    the raw source files' mtimes (i.e. without needing the raw dataset
-    present at all).
-
-    The cache filename carries a ``source_version`` signature computed from
-    the raw files' mtimes; recomputing it would require the (often multi-GB)
-    raw dataset just to find the cache, which is pointless on a
-    disk-constrained device like a Jetson that only has the small
-    ``split_cache/*.npz`` copied onto it. This instead globs for *any* cache
-    file matching this dataset/test_size/random_state, ignoring the source
-    suffix -- so ``dataset_key`` must change whenever the rows, labels or
-    features change. Callers should call this first and only fall back to
-    the raw files if it returns ``None``.
-    """
-    pattern = os.path.join(base_dir, "split_cache", f"{dataset_key}_ts{test_size}_rs{random_state}_src*.npz")
-    matches = sorted(glob.glob(pattern))
-    if not matches:
+def load_cached(dataset_key: str, base_dir: str, names, test_size: float = 0.33, random_state: int = 41):
+    """Only the requested arrays from the cache (an .npz reads members on
+    access, so a Pi never loads the test rows nor the server the train
+    rows). None if there is no cache."""
+    path = cached_split_path(dataset_key, base_dir, test_size, random_state)
+    if path is None:
         return None
-    with np.load(matches[0]) as data:
-        return data["x_train"], data["x_test"], data["y_train"], data["y_test"]
+    with np.load(path) as data:
+        return tuple(data[name] for name in names)
+
+
+def find_any_cached_split(dataset_key: str, base_dir: str, test_size: float = 0.33, random_state: int = 41):
+    """``(x_train, x_test, y_train, y_test)`` from the cache, or None."""
+    return load_cached(dataset_key, base_dir, ("x_train", "x_test", "y_train", "y_test"), test_size, random_state)
 
 
 def local_train_val_split(

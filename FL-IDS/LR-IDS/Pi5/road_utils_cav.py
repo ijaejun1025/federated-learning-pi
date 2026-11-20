@@ -54,13 +54,18 @@ Labels follow the authors' intervals exactly; a handful of injected frames
 (1-7 per capture) fall just outside an interval and stay labeled normal, as
 in the authors' own signal_extractions labels.
 
-Split: each capture is cut into 10 contiguous time blocks; blocks 2, 5 and 8
-are test (see ``common_cav.time_block_layout``).
+Split:
+- Attack types recorded three times (``*_attack_1/_2/_3``): captures 1 and
+  2 are train, 3 is test, so no injection session is on both sides.
+- Everything else (ambient, accelerator, the single coolant capture): 10
+  contiguous time blocks, blocks 2, 5 and 8 test (see
+  ``common_cav.time_block_layout``).
 """
 
 import glob
 import json
 import os
+import re
 import urllib.request
 import zipfile
 
@@ -72,13 +77,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROAD_DIR = os.path.join(BASE_DIR, "ROAD Dataset")
 # New key whenever the rows, labels or features change: caches are found by
 # key alone (see common_cav.find_any_cached_split), so an old one would be reused.
-DATASET_KEY = "road_inj_h12x"
-SAMPLING = common_cav.RowSampling()
+DATASET_KEY = "road_inj_h12x_s1"
+SAMPLING = common_cav.Sampling()
 ARTIFACT_ID = 0xFFF            # see module docstring
 MAX_STANDARD_ID = 0x7FF
-# Fraction of the ~19M-row training pool this client actually trains on.
-# Sized so the client fits in a 1GB Raspberry Pi; the test split is unchanged.
-CLIENT_TRAIN_FRACTION = 0.10
 SOURCE_URL = "https://zenodo.org/records/10462796"
 ZENODO_RECORD_API = "https://zenodo.org/api/records/10462796"
 
@@ -190,18 +192,41 @@ def _injected_frames(ts, can_id, payload_hex, entry) -> np.ndarray:
     return hit & payload_hex.str.match(pattern).to_numpy()
 
 
+REPEATED_ATTACK_RE = re.compile(r"_attack_([123])$")
+TEST_REPEAT = "3"
+
+
+def _split_of(path: str) -> str:
+    """Repeated attack captures by file (1, 2 train; 3 test), the rest by time blocks."""
+    name = os.path.splitext(os.path.basename(path))[0]
+    match = REPEATED_ATTACK_RE.search(name)
+    if match is None or name.startswith("accelerator_attack"):
+        return "blocks"
+    return "test" if match.group(1) == TEST_REPEAT else "train"
+
+
 def _captures() -> list:
     capture_metadata = _load_all_capture_metadata()
     # Masquerade variants are near-copies of their original capture; keeping
     # both would let the same frames appear on both sides of the split.
     log_files = [p for p in _ensure_raw_files() if "_masquerade" not in os.path.basename(p)]
-    return [
+    captures = [
         common_cav.Capture(
             os.path.basename(path), lambda path=path: _capture_frames(path, capture_metadata),
-            split="blocks", attack_free=_is_ambient(path),
+            split=_split_of(path), attack_free=_is_ambient(path),
         )
         for path in log_files
     ]
+    # Every repeated attack type must have both train and test captures.
+    repeats = {}
+    for c in captures:
+        match = REPEATED_ATTACK_RE.search(os.path.splitext(c.name)[0])
+        if c.split != "blocks" and match:
+            repeats.setdefault(c.name[:match.start()], set()).add(c.split)
+    missing = {kind: sides for kind, sides in repeats.items() if sides != {"train", "test"}}
+    if missing:
+        raise ValueError(f"repeated attack types without both train and test captures: {missing}")
+    return captures
 
 
 def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
@@ -214,22 +239,22 @@ def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41)
 
     log_files = _ensure_raw_files()
     source_version = common_cav.directory_signature(log_files + _find_metadata_files())
-    x_train, x_test, y_train, y_test, tables = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
-    return common_cav.cache_precomputed_split(
-        DATASET_KEY, BASE_DIR, x_train, x_test, y_train, y_test,
-        source_version, test_size, random_state, common_cav.period_table_arrays(tables),
+    split = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
+    return common_cav.cache_split(
+        DATASET_KEY, BASE_DIR, split, source_version, test_size, random_state,
+        common_cav.period_table_arrays(split.tables),
     )
 
 
 def get_client_data(test_size: float = 0.33, random_state: int = 41, local_val_size: float = 0.2):
-    pool = common_cav.load_cached_train_fraction(
-        DATASET_KEY, BASE_DIR, CLIENT_TRAIN_FRACTION, test_size, random_state,
-    )
-    if pool is None:
-        x_full, _, y_full, _ = get_global_train_test_split(test_size, random_state)
-        pool = common_cav.subsample_rows(x_full, y_full, CLIENT_TRAIN_FRACTION, random_state)
-    x_train_pool, y_train_pool = pool
-    return common_cav.local_train_val_split(x_train_pool, y_train_pool, local_val_size, random_state)
+    """The client's training rows (already sampled to their final size when
+    the cache was built), split into local train / validation."""
+    cached = common_cav.load_cached(DATASET_KEY, BASE_DIR, ("x_train", "y_train"), test_size, random_state)
+    if cached is None:
+        x_train, _, y_train, _ = get_global_train_test_split(test_size, random_state)
+    else:
+        x_train, y_train = cached
+    return common_cav.local_train_val_split(x_train, y_train, local_val_size, random_state)
 
 
 def get_test_split(test_size: float = 0.33, random_state: int = 41):

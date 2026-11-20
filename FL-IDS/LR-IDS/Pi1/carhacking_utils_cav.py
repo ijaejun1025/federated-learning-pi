@@ -21,15 +21,15 @@ and the shared tail is used once, as its own attack-free capture. The tail
 is checked against its known size, time span and hash.
 
 ``normal_run_data.txt`` (attack-free driving of the same car on another
-day, shipped as ``normal_run_data.7z``) only feeds the ID period table (see
-``common_cav``); it never becomes train or test rows. All 27 of its IDs
-occur in the attack captures, with matching periods (median ratio 1.00).
+day, shipped as ``normal_run_data.7z``) is a normal capture like the
+shared tail: time blocks for train/test, and its train blocks feed the ID
+period table (see ``common_cav``). All 27 of its IDs occur in the attack
+captures, with matching periods (median ratio 1.00).
 
 Split: each attack session and the shared tail are cut into 10 contiguous
 time blocks. Blocks 2, 5 and 8 are test; the rest are train (see
-``common_cav.time_block_layout``). The full blocks are used for test; each
-client trains on a random 15% of the training pool (see
-CLIENT_TRAIN_FRACTION).
+``common_cav.time_block_layout``). Rows are then sampled as set in
+``common_cav.Sampling`` (client training size, attack share, test normals).
 """
 
 import hashlib
@@ -47,9 +47,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CAV_DIR = os.path.join(BASE_DIR, "Car-Hacking Dataset")
 # New key whenever the rows, labels or features change: caches are found by
 # key alone (see common_cav.find_any_cached_split), so an old one would be reused.
-DATASET_KEY = "carhacking_h12t"
+DATASET_KEY = "carhacking_h12t_s1"
 NORMAL_RUN_FILE = os.path.join("normal_run_data", "normal_run_data.txt")
-SAMPLING = common_cav.RowSampling()
+SAMPLING = common_cav.Sampling()
 DROPBOX_CAV_ZIP_URL = (
     "https://www.dropbox.com/scl/fo/9rwsf9pclhvv9xxloojom/AF7JeRW893grZkigkulkAHk"
     "?rlkey=3h6zamu3kc262lrnipu5qden8&dl=1"
@@ -60,8 +60,6 @@ REQUIRED_CAV_FILES = [
     "gear_dataset.csv",
     "RPM_dataset.csv",
 ]
-# Fraction of the training pool each client trains on (test split is never sampled).
-CLIENT_TRAIN_FRACTION = 0.15
 # The attack-free recording appended to every capture file (see docstring).
 SHARED_TAIL_ROWS = 891_068
 SHARED_TAIL_SPAN = (1478200727.41947, 1478201209.058944)
@@ -196,7 +194,7 @@ def _normal_run_path() -> str:
 
 def _captures() -> list:
     captures = [common_cav.Capture("normal_run_data", lambda: _normal_run_frames(_normal_run_path()),
-                                   split="baseline", attack_free=True)]
+                                   split="blocks", attack_free=True)]
     for name in REQUIRED_CAV_FILES:
         captures.append(common_cav.Capture(f"{name} (attack session)", lambda name=name: _session_frames(name),
                                            split="blocks"))
@@ -215,26 +213,22 @@ def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41)
     source_version = common_cav.directory_signature(
         [os.path.join(CAV_DIR, name) for name in REQUIRED_CAV_FILES] + [_normal_run_path()]
     )
-    x_train, x_test, y_train, y_test, tables = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
-    return common_cav.cache_precomputed_split(
-        DATASET_KEY, BASE_DIR, x_train, x_test, y_train, y_test,
-        source_version, test_size, random_state, common_cav.period_table_arrays(tables),
+    split = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
+    return common_cav.cache_split(
+        DATASET_KEY, BASE_DIR, split, source_version, test_size, random_state,
+        common_cav.period_table_arrays(split.tables),
     )
 
 
-def get_client_data(
-    test_size: float = 0.33,
-    random_state: int = 41,
-    local_val_size: float = 0.2,
-):
-    pool = common_cav.load_cached_train_fraction(
-        DATASET_KEY, BASE_DIR, CLIENT_TRAIN_FRACTION, test_size, random_state,
-    )
-    if pool is None:
-        x_full, _, y_full, _ = get_global_train_test_split(test_size, random_state)
-        pool = common_cav.subsample_rows(x_full, y_full, CLIENT_TRAIN_FRACTION, random_state)
-    x_train_pool, y_train_pool = pool
-    return common_cav.local_train_val_split(x_train_pool, y_train_pool, local_val_size, random_state)
+def get_client_data(test_size: float = 0.33, random_state: int = 41, local_val_size: float = 0.2):
+    """The client's training rows (already sampled to their final size when
+    the cache was built), split into local train / validation."""
+    cached = common_cav.load_cached(DATASET_KEY, BASE_DIR, ("x_train", "y_train"), test_size, random_state)
+    if cached is None:
+        x_train, _, y_train, _ = get_global_train_test_split(test_size, random_state)
+    else:
+        x_train, y_train = cached
+    return common_cav.local_train_val_split(x_train, y_train, local_val_size, random_state)
 
 
 def get_test_split(test_size: float = 0.33, random_state: int = 41):

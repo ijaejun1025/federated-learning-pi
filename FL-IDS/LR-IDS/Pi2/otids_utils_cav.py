@@ -24,9 +24,8 @@ reveal "ID unseen in attack-free traffic" either (see ``common_cav``).
 The attack-free capture's train blocks feed the ID period table.
 
 Split: each capture is cut into 10 contiguous time blocks; blocks 2, 5 and 8
-are test (see ``common_cav.time_block_layout``). The client trains on a
-random 60% of the training pool (see CLIENT_TRAIN_FRACTION); the test split
-is never sampled.
+are test (see ``common_cav.time_block_layout``). Rows are then sampled as
+set in ``common_cav.Sampling``.
 """
 
 import glob
@@ -43,11 +42,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OTIDS_DIR = os.path.join(BASE_DIR, "OTIDS Dataset")
 # New key whenever the rows, labels or features change: caches are found by
 # key alone (see common_cav.find_any_cached_split), so an old one would be reused.
-DATASET_KEY = "otids_dos_h12r"
-SAMPLING = common_cav.RowSampling()
-# Brings Pi2's ~2.5M-row pool to about the same training size as the other
-# Pis, so it no longer has the slowest round or an outsized FedAvg weight.
-CLIENT_TRAIN_FRACTION = 0.60
+DATASET_KEY = "otids_dos_h12r_s1"
+SAMPLING = common_cav.Sampling()
 SOURCE_URL = "https://ocslab.hksecurity.net/Dataset/CAN-intrusion-dataset"
 DROPBOX_OTIDS_ZIP_URL = (
     "https://www.dropbox.com/scl/fo/8kll7yvbgogkp0vahowvm/ADhDIC8LRFL8wHUexib3C3w"
@@ -147,22 +143,22 @@ def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41)
     source_version = common_cav.directory_signature(
         os.path.join(OTIDS_DIR, name) for name in REQUIRED_FILES.values()
     )
-    x_train, x_test, y_train, y_test, tables = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
-    return common_cav.cache_precomputed_split(
-        DATASET_KEY, BASE_DIR, x_train, x_test, y_train, y_test,
-        source_version, test_size, random_state, common_cav.period_table_arrays(tables),
+    split = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
+    return common_cav.cache_split(
+        DATASET_KEY, BASE_DIR, split, source_version, test_size, random_state,
+        common_cav.period_table_arrays(split.tables),
     )
 
 
 def get_client_data(test_size: float = 0.33, random_state: int = 41, local_val_size: float = 0.2):
-    pool = common_cav.load_cached_train_fraction(
-        DATASET_KEY, BASE_DIR, CLIENT_TRAIN_FRACTION, test_size, random_state,
-    )
-    if pool is None:
-        x_full, _, y_full, _ = get_global_train_test_split(test_size, random_state)
-        pool = common_cav.subsample_rows(x_full, y_full, CLIENT_TRAIN_FRACTION, random_state)
-    x_train_pool, y_train_pool = pool
-    return common_cav.local_train_val_split(x_train_pool, y_train_pool, local_val_size, random_state)
+    """The client's training rows (already sampled to their final size when
+    the cache was built), split into local train / validation."""
+    cached = common_cav.load_cached(DATASET_KEY, BASE_DIR, ("x_train", "y_train"), test_size, random_state)
+    if cached is None:
+        x_train, _, y_train, _ = get_global_train_test_split(test_size, random_state)
+    else:
+        x_train, y_train = cached
+    return common_cav.local_train_val_split(x_train, y_train, local_val_size, random_state)
 
 
 def get_test_split(test_size: float = 0.33, random_state: int = 41):
