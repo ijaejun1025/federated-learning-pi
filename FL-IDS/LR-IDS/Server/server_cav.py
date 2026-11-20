@@ -2,7 +2,6 @@
 # coding: utf-8
 
 import datetime
-import glob
 import time
 import flwr as fl
 import numpy as np
@@ -30,19 +29,29 @@ import common_cav
 import otids_utils_cav
 import road_utils_cav
 import survival_utils_cav
-from model_cav import build_model, format_duration
+from model_cav import THRESHOLD_TARGET_FPR, build_model, format_duration
 
 NUM_ROUNDS = 3
+# Every round (threshold 0.5, progress monitoring): one row per dataset in
+# DATASET_METRICS_CSV, and the macro average / weighted pool in
+# ROUND_METRICS_CSV.
 ROUND_METRICS_CSV = os.path.join(BASE_DIR, "round_metrics.csv")
 DATASET_METRICS_CSV = os.path.join(BASE_DIR, "dataset_metrics.csv")
-# Generalization sets (Pi4: Forester unseen attacks, Traverse = a vehicle no
-# client trains on). Evaluated once, after the last round, and kept out of
-# round_metrics.csv / dataset_metrics.csv.
-GENERALIZATION_CSV = os.path.join(BASE_DIR, "generalization_metrics.csv")
+# After the last round: the four final results (see evaluate_final), and the
+# per-capture breakdown of the generalization sets (one capture = one attack
+# type).
+FINAL_RESULTS_CSV = os.path.join(BASE_DIR, "final_results.csv")
+FINAL_DATASETS_CSV = os.path.join(BASE_DIR, "final_dataset_metrics.csv")
 GENERALIZATION_FILES_CSV = os.path.join(BASE_DIR, "generalization_files.csv")
-# For a new vehicle, thresholds are also set from its own attack-free
-# recording (no labels): the score quantile that would give these FPRs there.
-CALIBRATED_FPR_TARGETS = (0.01, 0.001)
+# Result labels of Pi4's generalization sets (cantt_utils_cav.GEN_FILES).
+GENERALIZATION_RESULTS = {
+    "forester_unknown_attack": "2_trained_vehicle_new_attacks",
+    "traverse_known_attack": "3_new_vehicle_known_attacks",
+    "traverse_unknown_attack": "4_new_vehicle_new_attacks",
+}
+# Round 0 evaluates the untrained initial model; only a quick check that the
+# evaluation code runs is done then, on this many rows per dataset.
+SANITY_ROWS_PER_DATASET = 50_000
 CLIENT_METRICS_CSV = os.path.join(BASE_DIR, "client_metrics.csv")
 PROGRESS_LOG = os.path.join(BASE_DIR, "progress_log.txt")
 TEST_SIZE = 0.33
@@ -72,8 +81,10 @@ def log_progress(message: str) -> None:
 
 def _record_client_metrics(server_round, client, eval_res) -> None:
     """Append one row per Pi's own local-validation result for this round, so
-    all 6 clients' final numbers end up in one file on the server instead of
-    only printed on each Pi's own terminal."""
+    all 6 clients' numbers end up in one file on the server instead of only
+    printed on each Pi's own terminal. These ``local_val_*`` numbers come from
+    the clients' training-like data (3-20% attacks) and are not comparable
+    with the server's test metrics."""
     row = {
         "round": server_round,
         "client_name": eval_res.metrics.get("client_name", client.cid),
@@ -110,7 +121,13 @@ def _stop_if_any_failure(phase: str, server_round: int, failures) -> None:
 
 
 class LoggingFedAvg(fl.server.strategy.FedAvg):
-    """FedAvg with round start/end and per-client response logging."""
+    """FedAvg with round start/end and per-client response logging; after
+    the last round's federated evaluation it runs the final evaluation with
+    the decision thresholds the clients proposed."""
+
+    def __init__(self, evaluator=None, **kwargs):
+        super().__init__(**kwargs)
+        self.evaluator = evaluator
 
     def configure_fit(self, server_round, parameters, client_manager):
         log_progress(f"[ROUND {server_round}] fit round starting")
@@ -134,6 +151,7 @@ class LoggingFedAvg(fl.server.strategy.FedAvg):
         return super().configure_evaluate(server_round, parameters, client_manager)
 
     def aggregate_evaluate(self, server_round, results, failures):
+        thresholds = {}
         for client, eval_res in results:
             name = eval_res.metrics.get("client_name", client.cid)
             log_progress(
@@ -141,9 +159,16 @@ class LoggingFedAvg(fl.server.strategy.FedAvg):
                 f"(num_examples={eval_res.num_examples})"
             )
             _record_client_metrics(server_round, client, eval_res)
+            if "threshold_at_target_fpr" in eval_res.metrics:
+                thresholds[name] = float(eval_res.metrics["threshold_at_target_fpr"])
         _stop_if_any_failure("evaluate", server_round, failures)
         log_progress(f"[ROUND {server_round}] evaluate round done: {len(results)} ok")
-        return super().aggregate_evaluate(server_round, results, failures)
+        aggregated = super().aggregate_evaluate(server_round, results, failures)
+        # Flower evaluates centrally (evaluate_fn) before the clients, so the
+        # thresholds the clients propose for this round's model arrive here.
+        if self.evaluator is not None and server_round == NUM_ROUNDS:
+            self.evaluator.evaluate_final(server_round, thresholds)
+        return aggregated
 
 
 # One module per Raspberry Pi client; the server pools each dataset's
@@ -160,28 +185,35 @@ DATASETS = [
 DATASET_MODULES = [module for _, module in DATASETS]
 
 
-def _weighted_prf(cm):
-    """Weighted precision/recall/F1 from the 2x2 confusion matrix, with the
-    same definitions as sklearn's average="weighted", zero_division=0."""
-    tp = np.diag(cm).astype(np.float64)
-    pred = cm.sum(axis=0).astype(np.float64)
-    true = cm.sum(axis=1).astype(np.float64)
-    precision = np.divide(tp, pred, out=np.zeros(2), where=pred > 0)
-    recall = np.divide(tp, true, out=np.zeros(2), where=true > 0)
+# ------------------------------------------------------------------ metrics
+# Test sets keep every attack row but only a uniform sample of normal rows
+# (common_cav.Sampling); each row's weight says how many rows it stands for.
+# All counts and rates below are weighted, so they estimate the full test set.
+# Binary convention (common_cav.LABEL_TO_INT): 0 = Normal, 1 = Attack, and
+# precision / F1 are those of the attack class.
+
+def _confusion(y_true, y_pred, w):
+    """[[tn, fp], [fn, tp]] as weighted counts."""
+    return np.array([
+        [w[~y_true & ~y_pred].sum(), w[~y_true & y_pred].sum()],
+        [w[y_true & ~y_pred].sum(), w[y_true & y_pred].sum()],
+    ], dtype=np.float64)
+
+
+def _f1_weighted_avg(cm):
+    """F1 averaged over both classes, weighted by class size (sklearn's
+    average="weighted"). Kept for comparison with earlier runs only: with
+    >99% normal rows it stays near 1 even when attacks are missed."""
+    tp = np.diag(cm)
+    pred, true = cm.sum(axis=0), cm.sum(axis=1)
     f1 = np.divide(2 * tp, true + pred, out=np.zeros(2), where=(true + pred) > 0)
-    return (
-        np.average(precision, weights=true),
-        np.average(recall, weights=true),
-        np.average(f1, weights=true),
-    )
+    return float(np.average(f1, weights=true)) if true.sum() else 0.0
 
 
 def _mcc(cm):
-    """sklearn's matthews_corrcoef formula, applied to the confusion matrix."""
-    t_sum = cm.sum(axis=1, dtype=np.float64)
-    p_sum = cm.sum(axis=0, dtype=np.float64)
-    n_correct = np.trace(cm, dtype=np.float64)
-    n_samples = p_sum.sum()
+    """sklearn's matthews_corrcoef formula, on the (weighted) confusion matrix."""
+    t_sum, p_sum = cm.sum(axis=1), cm.sum(axis=0)
+    n_correct, n_samples = np.trace(cm), p_sum.sum()
     cov_ytyp = n_correct * n_samples - np.dot(t_sum, p_sum)
     cov_ypyp = n_samples ** 2 - np.dot(p_sum, p_sum)
     cov_ytyt = n_samples ** 2 - np.dot(t_sum, t_sum)
@@ -190,87 +222,73 @@ def _mcc(cm):
     return float(cov_ytyp / np.sqrt(cov_ypyp * cov_ytyt))
 
 
-def _roc_auc(y_true, scores):
-    """ROC AUC as the Mann-Whitney statistic (a tied attack/normal pair counts
-    1/2). Equals sklearn's roc_auc_score without its full-size copies. NaN
-    when only one class is present, where sklearn raises instead."""
-    pos = scores[y_true]
-    neg = scores[~y_true]
+def _roc_auc(y_true, scores, w):
+    """Weighted ROC AUC (Mann-Whitney: P(attack score > normal score), a tie
+    counts 1/2). NaN when one class is missing."""
+    pos, neg = scores[y_true], scores[~y_true]
+    w_pos, w_neg = w[y_true], w[~y_true]
     if len(pos) == 0 or len(neg) == 0:
         return float("nan")
-    neg.sort()
-    below = int(np.searchsorted(neg, pos, side="left").sum())
-    ties = int(np.searchsorted(neg, pos, side="right").sum()) - below
-    return (2 * below + ties) / (2 * len(pos) * len(neg))
+    order = np.argsort(neg, kind="mergesort")
+    neg, w_neg = neg[order], w_neg[order]
+    cum = np.r_[0.0, np.cumsum(w_neg, dtype=np.float64)]
+    below = cum[np.searchsorted(neg, pos, side="left")]
+    upto = cum[np.searchsorted(neg, pos, side="right")]
+    return float(np.sum(w_pos * (below + 0.5 * (upto - below))) / (w_pos.sum() * cum[-1]))
 
 
-def _binary_metrics(y_true, y_pred, p_attack):
-    """Metrics of one set of rows. Binary convention is fixed by
-    common_cav.LABEL_TO_INT: 0 = Normal, 1 = Attack."""
-    n = len(y_true)
-    tp = np.count_nonzero(y_true & y_pred)
-    fn = np.count_nonzero(y_true) - tp
-    fp = np.count_nonzero(y_pred) - tp
-    tn = n - tp - fn - fp
-    cm = np.array([[tn, fp], [fn, tp]], dtype=np.int64)
+def _pr_auc(y_true, scores, w):
+    """Weighted average precision (sklearn's definition: sum over thresholds of
+    (R_n - R_{n-1}) * P_n). Depends on the attack share, hence the weights."""
+    if not y_true.any():
+        return float("nan")
+    order = np.argsort(-scores, kind="mergesort")
+    s, yt, ww = scores[order], y_true[order], w[order]
+    tp_cum = np.cumsum(ww * yt, dtype=np.float64)
+    fp_cum = np.cumsum(ww * ~yt, dtype=np.float64)
+    last = np.r_[np.flatnonzero(np.diff(s)), len(s) - 1]  # last row of each distinct score
+    tp, fp = tp_cum[last], fp_cum[last]
+    precision = tp / (tp + fp)
+    recall = tp / tp_cum[-1]
+    return float(np.sum(np.diff(np.r_[0.0, recall]) * precision))
 
-    precision, recall, f1 = _weighted_prf(cm)
+
+def _binary_metrics(y_true, p_attack, w, threshold):
+    """Weighted metrics of one set of rows at one decision threshold."""
+    y_pred = p_attack > threshold
+    cm = _confusion(y_true, y_pred, w)
+    (tn, fp), (fn, tp) = cm
+    n = cm.sum()
+    precision = tp / (tp + fp) if tp + fp > 0 else 0.0
+    detection = tp / (tp + fn) if tp + fn > 0 else 0.0
     metrics = {
-        "accuracy": (tp + tn) / n,
+        "accuracy": (tp + tn) / n if n else 0.0,
         "precision": precision,
-        "recall": recall,
-        "f1_score": f1,
-        "detection_rate": tp / (tp + fn) if (tp + fn) > 0 else 0.0,
-        "fpr": fp / (fp + tn) if (fp + tn) > 0 else 0.0,
-        "fnr": fn / (fn + tp) if (fn + tp) > 0 else 0.0,
-        "roc_auc": _roc_auc(y_true, p_attack),
+        "detection_rate": detection,
+        "f1_score": 2 * precision * detection / (precision + detection) if precision + detection > 0 else 0.0,
+        "fpr": fp / (fp + tn) if fp + tn > 0 else 0.0,
+        "fnr": fn / (fn + tp) if fn + tp > 0 else 0.0,
+        "roc_auc": _roc_auc(y_true, p_attack, w),
+        "pr_auc": _pr_auc(y_true, p_attack, w),
         "mcc": _mcc(cm),
+        "f1_weighted_avg": _f1_weighted_avg(cm),
     }
-    return metrics, cm
+    counts = {"num_examples": n, "attack_examples": tp + fn, "sampled_rows": int(len(y_true)),
+              "tn": tn, "fp": fp, "fn": fn, "tp": tp}
+    return metrics, counts
 
 
-def _record_dataset_metrics(server_round, dataset_names, dataset_rows, y_true, y_pred, p_attack, loss_sums):
-    """Global model's metrics on each dataset's own test rows, plus their
-    unweighted mean (macro_avg). The pooled numbers in round_metrics.csv are
-    dominated by the largest test sets (ROAD, Car-Hacking); these show each
-    dataset on its own."""
-    rows = []
-    start = 0
-    for name, count, loss_sum in zip(dataset_names, dataset_rows, loss_sums):
-        end = start + count
-        metrics, cm = _binary_metrics(y_true[start:end], y_pred[start:end], p_attack[start:end])
-        (tn, fp), (fn, tp) = cm.tolist()
-        rows.append({
-            "round": server_round,
-            "dataset": name,
-            "num_examples": count,
-            "attack_examples": fn + tp,
-            "loss": loss_sum / count,
-            **metrics,
-            "tn": tn, "fp": fp, "fn": fn, "tp": tp,
-        })
-        start = end
-
-    table = pd.DataFrame(rows)
-    count_columns = ["num_examples", "attack_examples", "tn", "fp", "fn", "tp"]
-    # Rates are the unweighted mean over datasets; counts are the totals.
-    macro = {"round": server_round, "dataset": "macro_avg"}
-    macro.update(table[count_columns].sum().to_dict())
-    macro.update(table[["loss"] + list(metrics)].mean().to_dict())
-    table = pd.concat([table, pd.DataFrame([macro])], ignore_index=True)
-
-    print(f"Round {server_round} per-dataset metrics:")
-    print(table[["dataset", "num_examples", "accuracy", "f1_score", "detection_rate", "fpr", "roc_auc"]].to_string(index=False))
-    table.to_csv(
-        DATASET_METRICS_CSV,
-        mode="a",
-        header=not os.path.exists(DATASET_METRICS_CSV),
-        index=False,
-    )
+def _weighted_loss(y_true, p_attack, w):
+    """Weighted mean cross-entropy (probabilities clipped as Keras does)."""
+    p_true = np.where(y_true, p_attack, 1.0 - p_attack)
+    row_loss = -np.log(np.clip(p_true, KERAS_EPSILON, 1 - KERAS_EPSILON))
+    return float(np.sum(w * row_loss) / np.sum(w))
 
 
 def _predict_attack(model, x):
-    """P(attack) for every row, in chunks (see EVAL_CHUNK_ROWS)."""
+    """P(attack) for every row, in chunks (see EVAL_CHUNK_ROWS). One predict()
+    on the whole test set makes TensorFlow copy all of it into one tensor,
+    which ran the Jetson out of memory."""
     p = np.empty(len(x), dtype=np.float32)
     for start in range(0, len(x), EVAL_CHUNK_ROWS):
         end = min(start + EVAL_CHUNK_ROWS, len(x))
@@ -278,164 +296,191 @@ def _predict_attack(model, x):
     return p
 
 
-def evaluate_generalization(model, server_round):
-    """Final model on each generalization set, one set in memory at a time.
+def _append_csv(path, table):
+    table.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
 
-    Every set is scored at the default threshold 0.5 (the same decision as
-    the main evaluation). A new vehicle's set is also scored at thresholds
-    taken from that vehicle's attack-free calibration recording, which needs
-    no labels. Per-capture rows go to GENERALIZATION_FILES_CSV, so each attack
-    type can be reported on its own.
+
+class Evaluator:
+    """Server-side evaluation of the global model.
+
+    - Round 0 (untrained model): a quick run of the whole evaluation code on
+      SANITY_ROWS_PER_DATASET rows per dataset, nothing written.
+    - Rounds 1..NUM_ROUNDS: the six clients' test sets at threshold 0.5,
+      per dataset, macro average (every dataset counts the same) and
+      weighted pool (every row counts the same, so CAN-MIRGU's large normal
+      share dominates).
+    - After the last round's federated evaluation (evaluate_final): the four
+      final results, each at threshold 0.5 and at the median of the
+      thresholds the clients propose from their own validation normals; the
+      new vehicle's sets also at a threshold set on its attack-free
+      recording.
     """
-    log_progress(f"generalization evaluation of round {server_round} model started")
-    t_start = time.time()
-    set_rows, file_rows = [], []
-    # Row weights (capped test normals) are not applied to these metrics yet;
-    # detection rate, FPR and AUC do not need them.
-    for name, x, y, _weights, file_index, file_names, x_cal in cantt_utils_cav.iter_generalization_sets(TEST_SIZE, RANDOM_STATE):
-        y_true = y.astype(bool)
-        p = _predict_attack(model, x)
-        rules = [("default", 0.5, None)]
-        if x_cal is not None:
-            p_cal = _predict_attack(model, x_cal)
-            for target in CALIBRATED_FPR_TARGETS:
-                threshold = float(np.quantile(p_cal, 1 - target))
-                rules.append((f"calibrated_fpr_{target:g}", threshold, float((p_cal > threshold).mean())))
-        for rule, threshold, cal_fpr in rules:
-            y_pred = p > threshold
-            metrics, cm = _binary_metrics(y_true, y_pred, p)
-            (tn, fp), (fn, tp) = cm.tolist()
-            set_rows.append({"round": server_round, "set": name, "threshold_rule": rule, "threshold": threshold,
-                             "calibration_fpr": cal_fpr, "num_examples": len(y), "attack_examples": fn + tp,
-                             **metrics, "tn": tn, "fp": fp, "fn": fn, "tp": tp})
-            for i, file_name in enumerate(file_names):
-                m = file_index == i
-                attacks = int(y_true[m].sum())
-                normals = int(m.sum()) - attacks
-                file_rows.append({"round": server_round, "set": name, "file": file_name, "threshold_rule": rule,
-                                  "num_examples": int(m.sum()), "attack_examples": attacks,
-                                  "detection_rate": float(y_pred[m & y_true].mean()) if attacks else float("nan"),
-                                  "fpr": float(y_pred[m & ~y_true].mean()) if normals else float("nan")})
-        log_progress(f"generalization set {name}: {len(y)} rows done")
-        del x, y, p, file_index, x_cal
 
-    table = pd.DataFrame(set_rows)
-    print(table[["set", "threshold_rule", "threshold", "detection_rate", "fpr", "f1_score", "roc_auc"]].to_string(index=False))
-    table.to_csv(GENERALIZATION_CSV, mode="a", header=not os.path.exists(GENERALIZATION_CSV), index=False)
-    files = pd.DataFrame(file_rows)
-    files.to_csv(GENERALIZATION_FILES_CSV, mode="a", header=not os.path.exists(GENERALIZATION_FILES_CSV), index=False)
-    log_progress(f"generalization evaluation done in {format_duration(time.time() - t_start)}")
+    def __init__(self, model, x_test, y_test, w_test, dataset_names, dataset_rows, run_generalization):
+        self.model = model
+        self.x_test = x_test
+        self.y_true = y_test.astype(bool)
+        self.w = w_test.astype(np.float64)
+        self.dataset_names = dataset_names
+        self.bounds = np.r_[0, np.cumsum(dataset_rows)]
+        self.run_generalization = run_generalization
+        self.last_round = None
+        self.last_p = None
 
+    # ---- tables
+    def _dataset_table(self, p_attack, threshold, rule, rows=None):
+        """Per-dataset rows plus macro_avg and pooled_weighted rows."""
+        records = []
+        for i, name in enumerate(self.dataset_names):
+            lo, hi = self.bounds[i], self.bounds[i + 1]
+            if rows is not None:
+                hi = min(hi, lo + rows)
+            y, p, w = self.y_true[lo:hi], p_attack[lo:hi], self.w[lo:hi]
+            metrics, counts = _binary_metrics(y, p, w, threshold)
+            records.append({"dataset": name, "threshold_rule": rule, "threshold": threshold,
+                            "loss": _weighted_loss(y, p, w), **metrics, **counts})
+        table = pd.DataFrame(records)
+        metric_cols = ["loss"] + [c for c in records[0] if c in metrics]
+        count_cols = ["num_examples", "attack_examples", "sampled_rows", "tn", "fp", "fn", "tp"]
+        macro = {"dataset": "macro_avg", "threshold_rule": rule, "threshold": threshold}
+        macro.update(table[metric_cols].mean().to_dict())
+        macro.update(table[count_cols].sum().to_dict())
+        if rows is None:
+            metrics, counts = _binary_metrics(self.y_true, p_attack, self.w, threshold)
+            pooled = {"dataset": "pooled_weighted", "threshold_rule": rule, "threshold": threshold,
+                      "loss": _weighted_loss(self.y_true, p_attack, self.w), **metrics, **counts}
+            return pd.concat([table, pd.DataFrame([macro, pooled])], ignore_index=True)
+        return pd.concat([table, pd.DataFrame([macro])], ignore_index=True)
 
-def get_evaluate_fn(model, x_test, y_test, dataset_names, dataset_rows, run_generalization):
-    n = len(y_test)
-    y_true = y_test.astype(bool)
-    # Which dataset each test row came from (the test sets are concatenated
-    # in DATASETS order).
-    dataset_id = np.repeat(np.arange(len(dataset_rows), dtype=np.int8), dataset_rows)
-
-    def evaluate(server_round, parameters, config):
+    # ---- per round (Flower's evaluate_fn)
+    def evaluate_round(self, server_round, parameters, config):
+        self.model.set_weights(parameters)
+        if server_round == 0:
+            self._sanity_check()
+            return None
         t_start = time.time()
-        model.set_weights(parameters)
-
-        # Chunked: one evaluate()/predict() call on the whole ~17.5M-row test
-        # set makes TensorFlow copy all of it into a single tensor, which ran
-        # the Jetson out of memory.
-        loss_sum = 0.0
-        dataset_loss_sums = np.zeros(len(dataset_rows))
-        p_attack = np.empty(n, dtype=np.float32)
-        y_pred = np.empty(n, dtype=bool)
-        for start in range(0, n, EVAL_CHUNK_ROWS):
-            end = min(start + EVAL_CHUNK_ROWS, n)
-            x_chunk = x_test[start:end]
-            y_chunk = y_test[start:end]
-            chunk_loss, _ = model.evaluate(x_chunk, y_chunk.astype(np.int64), verbose=0)
-            loss_sum += chunk_loss * (end - start)
-            proba = model.predict(x_chunk, verbose=0)
-            p_attack[start:end] = proba[:, 1]
-            y_pred[start:end] = proba[:, 1] > proba[:, 0]  # same as argmax(axis=1)
-            # Per-row cross-entropy, to split the loss by dataset.
-            p_true = np.where(y_chunk == 1, proba[:, 1], proba[:, 0])
-            row_loss = -np.log(np.clip(p_true, KERAS_EPSILON, 1 - KERAS_EPSILON))
-            dataset_loss_sums += np.bincount(
-                dataset_id[start:end], weights=row_loss, minlength=len(dataset_rows),
-            )
-        loss = loss_sum / n
-
-        global_metrics, cm = _binary_metrics(y_true, y_pred, p_attack)
-        _record_dataset_metrics(
-            server_round, dataset_names, dataset_rows, y_true, y_pred, p_attack, dataset_loss_sums,
-        )
-
+        p_attack = _predict_attack(self.model, self.x_test)
+        table = self._dataset_table(p_attack, 0.5, "default_0.5")
+        table.insert(0, "round", server_round)
         elapsed = time.time() - t_start
+        print(f"Round {server_round} per-dataset metrics (threshold 0.5, weighted):")
+        print(table[["dataset", "detection_rate", "fpr", "precision", "f1_score", "roc_auc", "pr_auc"]].to_string(index=False))
+        _append_csv(DATASET_METRICS_CSV, table[~table.dataset.isin(["macro_avg", "pooled_weighted"])])
+        summary = table[table.dataset.isin(["macro_avg", "pooled_weighted"])].rename(columns={"dataset": "aggregate"})
+        summary["elapsed_sec"] = elapsed
+        _append_csv(ROUND_METRICS_CSV, summary)
+        self.last_round, self.last_p = server_round, p_attack
+        pooled = table[table.dataset == "pooled_weighted"].iloc[0]
+        macro = table[table.dataset == "macro_avg"].iloc[0]
+        return float(pooled["loss"]), {f"macro_{k}": float(macro[k]) for k in
+                                       ("detection_rate", "fpr", "precision", "f1_score", "roc_auc", "pr_auc")}
 
-        cm_df = pd.DataFrame(cm, index=["true_normal", "true_attack"], columns=["pred_normal", "pred_attack"])
-        cm_xlsx = os.path.join(BASE_DIR, f"confusion_matrix_round_{server_round}.xlsx")
-        cm_df.to_excel(cm_xlsx, index=True)
-        print(f"Round {server_round} confusion matrix:")
-        print(cm_df.to_string())
+    def _sanity_check(self):
+        """Run every metric on a small slice with the initial model, so a bug
+        in the evaluation shows up before hours of training, not after."""
+        t_start = time.time()
+        idx = np.concatenate([np.arange(lo, min(hi, lo + SANITY_ROWS_PER_DATASET))
+                              for lo, hi in zip(self.bounds[:-1], self.bounds[1:])])
+        p_small = np.zeros(len(self.y_true), dtype=np.float32)
+        p_small[idx] = _predict_attack(self.model, self.x_test[idx])
+        self._dataset_table(p_small, 0.5, "sanity", rows=SANITY_ROWS_PER_DATASET)
+        if self.run_generalization:
+            with np.load(common_cav.cached_split_path(cantt_utils_cav.GEN_DATASET_KEY, cantt_utils_cav.BASE_DIR,
+                                                      TEST_SIZE, RANDOM_STATE)) as data:
+                missing = [f"{k}_{n}" for n in data["set_names"].tolist() for k in ("x", "y", "w", "file", "files")
+                           if f"{k}_{n}" not in data.files]
+            if missing:
+                raise RuntimeError(f"generalization cache lacks {missing}")
+        log_progress(f"round 0: evaluation code checked on {len(idx)} rows in {format_duration(time.time() - t_start)} "
+                     f"(full evaluation starts after round 1)")
 
-        # Same column order as before, so rows still line up with an
-        # existing round_metrics.csv.
-        metrics_row = pd.DataFrame([{"round": server_round, "loss": loss, **global_metrics, "elapsed_sec": elapsed}])
-        metrics_row.to_csv(
-            ROUND_METRICS_CSV,
-            mode="a",
-            header=not os.path.exists(ROUND_METRICS_CSV),
-            index=False,
-        )
+    # ---- after the last round (called from aggregate_evaluate)
+    def evaluate_final(self, server_round, client_thresholds):
+        log_progress(f"final evaluation of round {server_round} model started")
+        t_start = time.time()
+        if self.last_round != server_round:
+            raise RuntimeError(f"no round {server_round} predictions (last evaluated round: {self.last_round})")
+        rules = [("default_0.5", 0.5)]
+        if client_thresholds:
+            median = float(np.median(list(client_thresholds.values())))
+            rules.append((f"client_median_fpr_{THRESHOLD_TARGET_FPR:g}", median))
+            log_progress("client thresholds: " + ", ".join(f"{k}={v:.5f}" for k, v in client_thresholds.items())
+                         + f" -> median {median:.5f}")
+        else:
+            log_progress("no client thresholds reported; final results at threshold 0.5 only")
 
-        if run_generalization and server_round == NUM_ROUNDS:
-            evaluate_generalization(model, server_round)
+        final_rows, dataset_tables = [], []
+        for rule, threshold in rules:
+            table = self._dataset_table(self.last_p, threshold, rule)
+            table.insert(0, "round", server_round)
+            dataset_tables.append(table)
+            for aggregate in ("macro_avg", "pooled_weighted"):
+                row = table[table.dataset == aggregate].iloc[0].to_dict()
+                row.pop("dataset")
+                final_rows.append({"result": "1_all_client_test_sets", "set": "six client test sets",
+                                   "aggregate": aggregate, **row})
+        _append_csv(FINAL_DATASETS_CSV, pd.concat(dataset_tables, ignore_index=True))
 
-        return loss, {**global_metrics, "elapsed_sec": elapsed}
+        if self.run_generalization:
+            final_rows += self._evaluate_generalization(server_round, rules)
+        final = pd.DataFrame(final_rows)
+        if "round" not in final:
+            final.insert(0, "round", server_round)
+        _append_csv(FINAL_RESULTS_CSV, final)
+        print("Final results (weighted):")
+        print(final[["result", "aggregate", "threshold_rule", "threshold", "detection_rate", "fpr", "precision",
+                     "f1_score", "roc_auc", "pr_auc"]].to_string(index=False))
+        log_progress(f"final evaluation done in {format_duration(time.time() - t_start)}")
 
-    return evaluate
+    def _evaluate_generalization(self, server_round, rules):
+        """Pi4's generalization sets, one in memory at a time."""
+        final_rows, file_rows = [], []
+        for name, x, y, w, file_index, file_names, x_cal in cantt_utils_cav.iter_generalization_sets(TEST_SIZE, RANDOM_STATE):
+            y_true, w = y.astype(bool), w.astype(np.float64)
+            p = _predict_attack(self.model, x)
+            set_rules = [(rule, threshold, None) for rule, threshold in rules]
+            if x_cal is not None:
+                p_cal = _predict_attack(self.model, x_cal)
+                threshold = float(np.quantile(p_cal, 1 - THRESHOLD_TARGET_FPR))
+                set_rules.append((f"vehicle_calibrated_fpr_{THRESHOLD_TARGET_FPR:g}", threshold, float((p_cal > threshold).mean())))
+            for rule, threshold, cal_fpr in set_rules:
+                metrics, counts = _binary_metrics(y_true, p, w, threshold)
+                final_rows.append({"round": server_round, "result": GENERALIZATION_RESULTS.get(name, name), "set": name,
+                                   "aggregate": "set", "threshold_rule": rule, "threshold": threshold,
+                                   "calibration_fpr": cal_fpr, "loss": _weighted_loss(y_true, p, w), **metrics, **counts})
+                for i, file_name in enumerate(file_names):
+                    m = file_index == i
+                    y_pred = p > threshold
+                    attacks = float(w[m & y_true].sum())
+                    normals = float(w[m & ~y_true].sum())
+                    file_rows.append({
+                        "round": server_round, "result": GENERALIZATION_RESULTS.get(name, name), "set": name,
+                        "file": file_name, "threshold_rule": rule, "threshold": threshold,
+                        "num_examples": attacks + normals, "attack_examples": attacks, "sampled_rows": int(m.sum()),
+                        "detection_rate": float(w[m & y_true & y_pred].sum() / attacks) if attacks else float("nan"),
+                        "fpr": float(w[m & ~y_true & y_pred].sum() / normals) if normals else float("nan"),
+                    })
+            log_progress(f"generalization set {name}: {len(y)} rows done")
+            del x, y, w, p, file_index, x_cal
+        _append_csv(GENERALIZATION_FILES_CSV, pd.DataFrame(file_rows))
+        return final_rows
 
 
-def _cache_matches(dataset_module):
-    pattern = os.path.join(
-        dataset_module.BASE_DIR, "split_cache",
-        f"{dataset_module.DATASET_KEY}_ts{TEST_SIZE}_rs{RANDOM_STATE}_src*.npz",
-    )
-    return sorted(glob.glob(pattern))
-
-
-def report_cache_status(dataset_module):
-    if _cache_matches(dataset_module):
-        print(f"[CACHE] {dataset_module.DATASET_KEY}: found split_cache, no raw data download needed", flush=True)
-    else:
-        print(f"[CACHE] {dataset_module.DATASET_KEY}: NO split_cache found, raw data will be downloaded/processed", flush=True)
+def _cache_path(dataset_module):
+    return common_cav.cached_split_path(dataset_module.DATASET_KEY, dataset_module.BASE_DIR, TEST_SIZE, RANDOM_STATE)
 
 
 def load_test_split(dataset_module):
-    """Only x_test/y_test from the cache: an .npz reads members on access, so
-    the much larger x_train is never loaded on the server."""
-    matches = _cache_matches(dataset_module)
-    if not matches:
-        return dataset_module.get_test_split(test_size=TEST_SIZE, random_state=RANDOM_STATE)
-    with np.load(matches[0]) as data:
-        return data["x_test"], data["y_test"]
+    """x_test / y_test / w_test from the cache (the train rows are never
+    read on the server); builds the cache from raw data if there is none."""
+    if _cache_path(dataset_module) is None:
+        print(f"[CACHE] {dataset_module.DATASET_KEY}: NO split_cache found, raw data will be downloaded/processed", flush=True)
+        dataset_module.get_global_train_test_split(test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    else:
+        print(f"[CACHE] {dataset_module.DATASET_KEY}: found split_cache", flush=True)
+    return common_cav.load_cached(dataset_module.DATASET_KEY, dataset_module.BASE_DIR,
+                                  ("x_test", "y_test", "w_test"), TEST_SIZE, RANDOM_STATE)
 
-
-x_test_parts = []
-y_test_parts = []
-dataset_names = []
-dataset_rows = []
-for dataset_name, dataset_module in DATASETS:
-    report_cache_status(dataset_module)
-    x_part, y_part = load_test_split(dataset_module)
-    x_test_parts.append(x_part)
-    y_test_parts.append(y_part)
-    dataset_names.append(dataset_name)
-    dataset_rows.append(len(y_part))
-    print(f"[DATA] {dataset_name}: {len(y_part)} test rows", flush=True)
-
-x_test = np.concatenate(x_test_parts)
-y_test = np.concatenate(y_test_parts).astype(np.int8)
-# Drop the per-dataset copies; otherwise the test set sits in memory twice.
-del x_test_parts, y_test_parts, x_part, y_part
-x_test = common_cav.reshape_for_cnn(x_test)
 
 def round_config(server_round):
     """Sent to every Pi with each fit/evaluate request, so its progress lines
@@ -443,28 +488,45 @@ def round_config(server_round):
     return {"server_round": server_round, "num_rounds": NUM_ROUNDS}
 
 
-# Checked now rather than after the last round: building the generalization
-# cache needs ~1.3 GB of raw data that the Jetson does not have.
-run_generalization = common_cav.cached_split_path(
-    cantt_utils_cav.GEN_DATASET_KEY, cantt_utils_cav.BASE_DIR, TEST_SIZE, RANDOM_STATE) is not None
-if run_generalization:
-    print(f"[CACHE] {cantt_utils_cav.GEN_DATASET_KEY}: found, generalization sets will be evaluated after round {NUM_ROUNDS}", flush=True)
-else:
-    print(f"[CACHE] {cantt_utils_cav.GEN_DATASET_KEY}: NOT found, generalization evaluation will be SKIPPED "
-          f"(copy Pi4/split_cache/{cantt_utils_cav.GEN_DATASET_KEY}_*.npz to enable it)", flush=True)
+if __name__ == "__main__":
+    x_parts, y_parts, w_parts, dataset_names, dataset_rows = [], [], [], [], []
+    for dataset_name, dataset_module in DATASETS:
+        x_part, y_part, w_part = load_test_split(dataset_module)
+        x_parts.append(x_part); y_parts.append(y_part); w_parts.append(w_part)
+        dataset_names.append(dataset_name)
+        dataset_rows.append(len(y_part))
+        print(f"[DATA] {dataset_name}: {len(y_part)} test rows ({int(y_part.sum())} attack), "
+              f"standing for {w_part.sum():.0f} rows", flush=True)
+    x_test = common_cav.reshape_for_cnn(np.concatenate(x_parts))
+    y_test = np.concatenate(y_parts).astype(np.int8)
+    w_test = np.concatenate(w_parts).astype(np.float32)
+    # Drop the per-dataset copies; otherwise the test set sits in memory twice.
+    del x_parts, y_parts, w_parts, x_part, y_part, w_part
 
-model = build_model((x_test.shape[1], x_test.shape[2]))
-strategy = LoggingFedAvg(
-    evaluate_fn=get_evaluate_fn(model, x_test, y_test, dataset_names, dataset_rows, run_generalization),
-    on_fit_config_fn=round_config,
-    on_evaluate_config_fn=round_config,
-    min_fit_clients=len(DATASET_MODULES),
-    min_evaluate_clients=len(DATASET_MODULES),
-    min_available_clients=len(DATASET_MODULES),
-)
+    # Checked now rather than after the last round: building the
+    # generalization cache needs ~1.3 GB of raw data the Jetson does not have.
+    run_generalization = common_cav.cached_split_path(
+        cantt_utils_cav.GEN_DATASET_KEY, cantt_utils_cav.BASE_DIR, TEST_SIZE, RANDOM_STATE) is not None
+    if run_generalization:
+        print(f"[CACHE] {cantt_utils_cav.GEN_DATASET_KEY}: found, results 2-4 will be evaluated after round {NUM_ROUNDS}", flush=True)
+    else:
+        print(f"[CACHE] {cantt_utils_cav.GEN_DATASET_KEY}: NOT found, results 2-4 will be SKIPPED "
+              f"(copy Pi4/split_cache/{cantt_utils_cav.GEN_DATASET_KEY}_*.npz to enable them)", flush=True)
 
-fl.server.start_server(
-    server_address="0.0.0.0:3040",
-    config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS, round_timeout=ROUND_TIMEOUT_SEC),
-    strategy=strategy,
-)
+    model = build_model((x_test.shape[1], x_test.shape[2]))
+    evaluator = Evaluator(model, x_test, y_test, w_test, dataset_names, dataset_rows, run_generalization)
+    strategy = LoggingFedAvg(
+        evaluator=evaluator,
+        evaluate_fn=evaluator.evaluate_round,
+        on_fit_config_fn=round_config,
+        on_evaluate_config_fn=round_config,
+        min_fit_clients=len(DATASET_MODULES),
+        min_evaluate_clients=len(DATASET_MODULES),
+        min_available_clients=len(DATASET_MODULES),
+    )
+
+    fl.server.start_server(
+        server_address="0.0.0.0:3040",
+        config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS, round_timeout=ROUND_TIMEOUT_SEC),
+        strategy=strategy,
+    )

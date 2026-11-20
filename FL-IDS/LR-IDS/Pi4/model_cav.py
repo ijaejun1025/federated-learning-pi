@@ -8,6 +8,11 @@ import time
 import numpy as np
 from tensorflow import keras
 
+# Each client proposes a decision threshold: the attack score that only this
+# share of its local validation normal frames exceed. The server uses the
+# median of the six (only this number leaves a Pi, never its data).
+THRESHOLD_TARGET_FPR = 0.001
+
 
 def build_model(input_shape):
     model = keras.Sequential([

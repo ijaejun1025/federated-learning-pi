@@ -76,10 +76,20 @@ Each Pi also accepts `--client-id <n>` purely as a log label (defaults are alrea
 
 ## Output
 
-- `Server/round_metrics.csv` — one row per round: accuracy, precision, recall, F1, detection_rate, FPR, FNR, ROC-AUC, MCC, elapsed_sec.
-- `Server/confusion_matrix_round_<N>.xlsx` — confusion matrix for that round's global model.
-- `Server/generalization_metrics.csv` / `generalization_files.csv` — written once, after the last round: the final model on sets no client trains on (Pi4's can-train-and-test: Forester unseen attacks `test_03` without `double-1`; the 2011 Chevrolet Traverse `test_02` known attacks and `test_04` unseen attacks). Each set at threshold 0.5; the Traverse sets also at thresholds set from the Traverse's own attack-free recording for 1% / 0.1% FPR (no labels). Per capture (= attack type) in the `_files` CSV. Needs `Pi4/split_cache/cantt04_gen_h12_s1_*.npz` on the Jetson; without it the server says so at startup and skips this step. These numbers are kept out of `round_metrics.csv` and `dataset_metrics.csv`.
-- 3 rounds run by default (`num_rounds=3` in `server_cav.py`).
+All server metrics are weighted by the test rows' `w_test` (so they estimate the full test sets), and precision / F1 are those of the attack class; `f1_weighted_avg` (sklearn's average="weighted", near 1 whenever normals dominate) is kept for comparison only. Columns: accuracy, precision, detection_rate, f1_score, fpr, fnr, roc_auc, pr_auc, mcc, f1_weighted_avg, loss, weighted counts (tn/fp/fn/tp, num_examples, attack_examples) and `sampled_rows`.
+
+Every round (threshold 0.5, for monitoring):
+- `Server/dataset_metrics.csv` — one row per client test set.
+- `Server/round_metrics.csv` — `macro_avg` (mean over the six datasets, each counts the same) and `pooled_weighted` (all rows pooled; CAN-MIRGU's large normal share dominates).
+- Round 0 (the untrained model) only checks that the evaluation code runs, on 50,000 rows per dataset.
+
+After the last round, once the clients have reported their thresholds:
+- `Server/final_results.csv` — the four results: `1_all_client_test_sets` (macro_avg and pooled_weighted), `2_trained_vehicle_new_attacks` (Forester `test_03` without `double-1`), `3_new_vehicle_known_attacks` (2011 Chevrolet Traverse `test_02`), `4_new_vehicle_new_attacks` (Traverse `test_04`). Each at threshold 0.5 and at the median of the clients' proposed thresholds (`client_median_fpr_0.001`: the score each client's local validation normals exceed with probability 0.1%; only that number leaves a Pi). The Traverse sets also at `vehicle_calibrated_fpr_0.001`, set on the Traverse's own attack-free recording (no labels).
+- `Server/final_dataset_metrics.csv` — result 1 per dataset at both thresholds.
+- `Server/generalization_files.csv` — results 2-4 per capture (= attack type).
+- Results 2-4 need `Pi4/split_cache/cantt04_gen_h12_s1_*.npz` on the Jetson; without it the server says so at startup and skips them.
+- `Server/client_metrics.csv` — each Pi's `local_val_*` numbers (training-like mix of 3-20% attacks, not comparable with the test metrics) and its proposed threshold.
+- 3 rounds run by default (`NUM_ROUNDS` in `server_cav.py`).
 
 ## Requirements
 

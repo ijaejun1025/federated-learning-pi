@@ -10,7 +10,7 @@ import numpy as np
 from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score
 
 import survival_utils_cav as dataset
-from model_cav import BatchSequence, ProgressLog, build_model, format_duration, progress_callbacks
+from model_cav import THRESHOLD_TARGET_FPR, BatchSequence, ProgressLog, build_model, format_duration, progress_callbacks
 
 TEST_SIZE = 0.33
 RANDOM_STATE = 41
@@ -72,28 +72,36 @@ class FlowerClient(fl.client.NumPyClient):
 
         y_pred_proba = model.predict(BatchSequence(x_val), verbose=0)
         y_pred = y_pred_proba.argmax(axis=1)
+        p_attack = y_pred_proba[:, 1]
 
-        f1 = f1_score(y_val, y_pred, average="weighted", zero_division=0)
-        precision = precision_score(y_val, y_pred, average="weighted", zero_division=0)
-        recall = recall_score(y_val, y_pred, average="weighted", zero_division=0)
-
-        map_score = average_precision_score(y_val, y_pred_proba[:, 1])
+        # Local validation keeps the training mix (3-20% attacks), so these
+        # are progress checks only, not comparable with the server's metrics.
+        f1 = f1_score(y_val, y_pred, zero_division=0)
+        precision = precision_score(y_val, y_pred, zero_division=0)
+        recall = recall_score(y_val, y_pred, zero_division=0)
+        map_score = average_precision_score(y_val, p_attack)
+        # This client's proposed decision threshold (see THRESHOLD_TARGET_FPR).
+        threshold = float(np.quantile(p_attack[y_val == 0], 1 - THRESHOLD_TARGET_FPR))
 
         print(
-            f"Client {args.client_id} eval accuracy: {accuracy:.4f}, "
-            f"F1: {f1:.4f}, MAP: {map_score:.4f}, "
-            f"Precision: {precision:.4f}, Recall: {recall:.4f}"
+            f"Client {args.client_id} local val accuracy: {accuracy:.4f}, "
+            f"attack F1: {f1:.4f}, PR-AUC: {map_score:.4f}, "
+            f"attack precision: {precision:.4f}, detection rate: {recall:.4f}, "
+            f"threshold at FPR {THRESHOLD_TARGET_FPR:g}: {threshold:.5f}"
         )
 
-        progress.write(config, f"round finished (local val accuracy={accuracy:.4f}, F1={f1:.4f})")
+        progress.write(config, f"round finished (local val accuracy={accuracy:.4f}, attack F1={f1:.4f}, "
+                               f"threshold={threshold:.5f})")
 
         return loss, len(x_val), {
             "client_name": CLIENT_NAME,
-            "accuracy": float(accuracy),
-            "f1_score": float(f1),
-            "map": float(map_score),
-            "precision": float(precision),
-            "recall": float(recall),
+            "local_val_accuracy": float(accuracy),
+            "local_val_attack_f1": float(f1),
+            "local_val_pr_auc": float(map_score),
+            "local_val_attack_precision": float(precision),
+            "local_val_detection_rate": float(recall),
+            "local_val_attack_share": float(np.mean(y_val)),
+            "threshold_at_target_fpr": threshold,
         }
 
 
