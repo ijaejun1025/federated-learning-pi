@@ -4,23 +4,33 @@
 """HCRL CAN-intrusion-dataset (OTIDS) loader -- Pi2 (Kia Soul).
 
 Raw data is auto-downloaded from HCRL's Dropbox share. Used captures:
-attack-free (all normal), DoS and Impersonation. The Fuzzy capture is
-excluded: its only label source is a time threshold (everything after
-~250 s counted as attack), which is not per-frame ground truth.
+attack-free (all normal) and DoS. Excluded:
 
-Labels: DoS frames are the ones with arbitration ID 0x000, Impersonation
-frames the ones with ID 0x164 (HCRL's injection IDs). CAN ID is used only
-to derive the label, never as a feature.
+- Fuzzy: its only label source is a time threshold (everything after
+  ~250 s counted as attack), which is not per-frame ground truth, and it
+  injects no ID the attack-free capture lacks, so ID can't label it either.
+- Impersonation: labeling every 0x164 frame as attack isn't supported by
+  the data. Apart from 5,697 frames with payload 01 02 .. 08, its 0x164
+  frames match the genuine ECU's in payload, rate (107 vs 111 Hz) and
+  remote-frame response time (median 0.258 vs 0.257 ms), so which frames
+  came from the attacker can't be told.
+
+Labels: DoS frames are the ones with arbitration ID 0x000 (HCRL's injection
+ID), which never occurs in the attack-free capture. CAN ID is used only to
+derive the label and to find each frame's previous same-ID frame, never as
+a feature. Because the label is defined by the ID, the features must not
+reveal "ID unseen in attack-free traffic" either (see ``common_cav``).
+
+The attack-free capture's train blocks feed the ID period table.
 
 Split: each capture is cut into 10 contiguous time blocks; blocks 2, 5 and 8
-are test (see ``common_cav.split_time_blocks``). The client trains on a
+are test (see ``common_cav.time_block_layout``). The client trains on a
 random 60% of the training pool (see CLIENT_TRAIN_FRACTION); the test split
 is never sampled.
 """
 
 import glob
 import os
-import re
 import shutil
 import urllib.request
 import zipfile
@@ -31,7 +41,10 @@ import common_cav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OTIDS_DIR = os.path.join(BASE_DIR, "OTIDS Dataset")
-DATASET_KEY = "otids_blk"
+# New key whenever the rows, labels or features change: caches are found by
+# key alone (see common_cav.find_any_cached_split), so an old one would be reused.
+DATASET_KEY = "otids_dos_h12r"
+SAMPLING = common_cav.RowSampling()
 # Brings Pi2's ~2.5M-row pool to about the same training size as the other
 # Pis, so it no longer has the slowest round or an outsized FedAvg weight.
 CLIENT_TRAIN_FRACTION = 0.60
@@ -44,17 +57,11 @@ DROPBOX_OTIDS_ZIP_URL = (
 REQUIRED_FILES = {
     "normal": "Attack_free_dataset.txt",
     "dos": "DoS_attack_dataset.txt",
-    "impersonation": "Impersonation_attack_dataset.txt",
 }
 
 DOS_INJECTED_ID = 0x000
-IMPERSONATION_INJECTED_ID = 0x164
 
 reshape_for_cnn = common_cav.reshape_for_cnn
-
-_LINE_RE = re.compile(
-    r"Timestamp:\s*([\d.]+)\s+ID:\s*([0-9a-fA-F]+)\s+\d+\s+DLC:\s*(\d+)\s+((?:[0-9a-fA-F]{2}\s*)*)"
-)
 
 
 def _find_file_recursively(file_name: str):
@@ -110,46 +117,25 @@ def _ensure_raw_files() -> None:
         )
 
 
-def _parse_otids_file(path: str):
-    rows = []
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            match = _LINE_RE.search(line)
-            if not match:
-                continue
-            can_id = int(match.group(2), 16)
-            dlc = int(match.group(3))
-            data_bytes = [int(b, 16) for b in match.group(4).split()]
-            rows.append((can_id, dlc, data_bytes))
-    return rows
+def _capture_frames(path: str, is_dos: bool) -> common_cav.Frames:
+    """Remote frames (frame type field ``100``, DLC 0, no data) are kept and
+    marked. 9 IDs answer them about 0.25 ms later with an all-zero DLC-8 data
+    frame, a millisecond or two after their own periodic frame; requests and
+    replies get their own history streams (see ``common_cav.frame_streams``),
+    otherwise those replies look exactly like the DoS frames."""
+    ts, can_id, dlc, data, rtr = common_cav.parse_hcrl_txt(path)
+    can_id = np.asarray(can_id)
+    y = (can_id == DOS_INJECTED_ID) if is_dos else np.zeros(len(can_id), dtype=bool)
+    return common_cav.make_frames(ts, can_id, dlc, data, y, rtr=rtr)
 
 
-def _file_arrays(path: str, label_fn):
-    rows = _parse_otids_file(path)
-    x = np.asarray(
-        [common_cav.build_frame_features(dlc, data) for _, dlc, data in rows],
-        dtype=np.float32,
-    )
-    y = np.asarray([label_fn(can_id) for can_id, _, _ in rows], dtype=np.int64)
-    return x, y
-
-
-def _load_block_split():
-    sources = [
-        (REQUIRED_FILES["normal"], lambda _: 0),
-        (REQUIRED_FILES["dos"], lambda cid: int(cid == DOS_INJECTED_ID)),
-        (REQUIRED_FILES["impersonation"], lambda cid: int(cid == IMPERSONATION_INJECTED_ID)),
+def _captures() -> list:
+    normal = os.path.join(OTIDS_DIR, REQUIRED_FILES["normal"])
+    dos = os.path.join(OTIDS_DIR, REQUIRED_FILES["dos"])
+    return [
+        common_cav.Capture("attack_free", lambda: _capture_frames(normal, False), split="blocks", attack_free=True),
+        common_cav.Capture("dos", lambda: _capture_frames(dos, True), split="blocks"),
     ]
-    parts = []
-    for name, label_fn in sources:
-        x, y = _file_arrays(os.path.join(OTIDS_DIR, name), label_fn)
-        train_idx, test_idx = common_cav.split_time_blocks(len(y))
-        parts.append((x[train_idx], y[train_idx], x[test_idx], y[test_idx]))
-    x_train = np.concatenate([p[0] for p in parts])
-    y_train = np.concatenate([p[1] for p in parts])
-    x_test = np.concatenate([p[2] for p in parts])
-    y_test = np.concatenate([p[3] for p in parts])
-    return x_train, x_test, y_train, y_test
 
 
 def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
@@ -161,10 +147,10 @@ def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41)
     source_version = common_cav.directory_signature(
         os.path.join(OTIDS_DIR, name) for name in REQUIRED_FILES.values()
     )
-    x_train, x_test, y_train, y_test = _load_block_split()
+    x_train, x_test, y_train, y_test, tables = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
     return common_cav.cache_precomputed_split(
         DATASET_KEY, BASE_DIR, x_train, x_test, y_train, y_test,
-        source_version, test_size, random_state,
+        source_version, test_size, random_state, common_cav.period_table_arrays(tables),
     )
 
 

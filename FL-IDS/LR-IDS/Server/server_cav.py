@@ -24,8 +24,8 @@ for _pi_folder in ("Pi1", "Pi2", "Pi3", "Pi4", "Pi5", "Pi6"):
     sys.path.append(os.path.join(LR_IDS_DIR, _pi_folder))
 
 import canmirgu_utils_cav
+import cantt_utils_cav
 import carhacking_utils_cav
-import ciciov_utils_cav
 import common_cav
 import otids_utils_cav
 import road_utils_cav
@@ -35,6 +35,14 @@ from model_cav import build_model, format_duration
 NUM_ROUNDS = 3
 ROUND_METRICS_CSV = os.path.join(BASE_DIR, "round_metrics.csv")
 DATASET_METRICS_CSV = os.path.join(BASE_DIR, "dataset_metrics.csv")
+# Generalization sets (Pi4: Forester unseen attacks, Traverse = a vehicle no
+# client trains on). Evaluated once, after the last round, and kept out of
+# round_metrics.csv / dataset_metrics.csv.
+GENERALIZATION_CSV = os.path.join(BASE_DIR, "generalization_metrics.csv")
+GENERALIZATION_FILES_CSV = os.path.join(BASE_DIR, "generalization_files.csv")
+# For a new vehicle, thresholds are also set from its own attack-free
+# recording (no labels): the score quantile that would give these FPRs there.
+CALIBRATED_FPR_TARGETS = (0.01, 0.001)
 CLIENT_METRICS_CSV = os.path.join(BASE_DIR, "client_metrics.csv")
 PROGRESS_LOG = os.path.join(BASE_DIR, "progress_log.txt")
 TEST_SIZE = 0.33
@@ -145,7 +153,7 @@ DATASETS = [
     ("Pi1-carhacking", carhacking_utils_cav),  # HCRL Car-Hacking Dataset
     ("Pi2-otids", otids_utils_cav),            # HCRL CAN-intrusion-dataset (OTIDS)
     ("Pi3-survival", survival_utils_cav),      # HCRL Survival Analysis Dataset
-    ("Pi4-ciciov", ciciov_utils_cav),          # CIC IoV Dataset 2024
+    ("Pi4-cantt", cantt_utils_cav),            # can-train-and-test, set_04
     ("Pi5-road", road_utils_cav),              # ROAD Dataset (ORNL)
     ("Pi6-canmirgu", canmirgu_utils_cav),      # CAN-MIRGU
 ]
@@ -261,7 +269,63 @@ def _record_dataset_metrics(server_round, dataset_names, dataset_rows, y_true, y
     )
 
 
-def get_evaluate_fn(model, x_test, y_test, dataset_names, dataset_rows):
+def _predict_attack(model, x):
+    """P(attack) for every row, in chunks (see EVAL_CHUNK_ROWS)."""
+    p = np.empty(len(x), dtype=np.float32)
+    for start in range(0, len(x), EVAL_CHUNK_ROWS):
+        end = min(start + EVAL_CHUNK_ROWS, len(x))
+        p[start:end] = model.predict(common_cav.reshape_for_cnn(x[start:end]), verbose=0)[:, 1]
+    return p
+
+
+def evaluate_generalization(model, server_round):
+    """Final model on each generalization set, one set in memory at a time.
+
+    Every set is scored at the default threshold 0.5 (the same decision as
+    the main evaluation). A new vehicle's set is also scored at thresholds
+    taken from that vehicle's attack-free calibration recording, which needs
+    no labels. Per-capture rows go to GENERALIZATION_FILES_CSV, so each attack
+    type can be reported on its own.
+    """
+    log_progress(f"generalization evaluation of round {server_round} model started")
+    t_start = time.time()
+    set_rows, file_rows = [], []
+    for name, x, y, file_index, file_names, x_cal in cantt_utils_cav.iter_generalization_sets(TEST_SIZE, RANDOM_STATE):
+        y_true = y.astype(bool)
+        p = _predict_attack(model, x)
+        rules = [("default", 0.5, None)]
+        if x_cal is not None:
+            p_cal = _predict_attack(model, x_cal)
+            for target in CALIBRATED_FPR_TARGETS:
+                threshold = float(np.quantile(p_cal, 1 - target))
+                rules.append((f"calibrated_fpr_{target:g}", threshold, float((p_cal > threshold).mean())))
+        for rule, threshold, cal_fpr in rules:
+            y_pred = p > threshold
+            metrics, cm = _binary_metrics(y_true, y_pred, p)
+            (tn, fp), (fn, tp) = cm.tolist()
+            set_rows.append({"round": server_round, "set": name, "threshold_rule": rule, "threshold": threshold,
+                             "calibration_fpr": cal_fpr, "num_examples": len(y), "attack_examples": fn + tp,
+                             **metrics, "tn": tn, "fp": fp, "fn": fn, "tp": tp})
+            for i, file_name in enumerate(file_names):
+                m = file_index == i
+                attacks = int(y_true[m].sum())
+                normals = int(m.sum()) - attacks
+                file_rows.append({"round": server_round, "set": name, "file": file_name, "threshold_rule": rule,
+                                  "num_examples": int(m.sum()), "attack_examples": attacks,
+                                  "detection_rate": float(y_pred[m & y_true].mean()) if attacks else float("nan"),
+                                  "fpr": float(y_pred[m & ~y_true].mean()) if normals else float("nan")})
+        log_progress(f"generalization set {name}: {len(y)} rows done")
+        del x, y, p, file_index, x_cal
+
+    table = pd.DataFrame(set_rows)
+    print(table[["set", "threshold_rule", "threshold", "detection_rate", "fpr", "f1_score", "roc_auc"]].to_string(index=False))
+    table.to_csv(GENERALIZATION_CSV, mode="a", header=not os.path.exists(GENERALIZATION_CSV), index=False)
+    files = pd.DataFrame(file_rows)
+    files.to_csv(GENERALIZATION_FILES_CSV, mode="a", header=not os.path.exists(GENERALIZATION_FILES_CSV), index=False)
+    log_progress(f"generalization evaluation done in {format_duration(time.time() - t_start)}")
+
+
+def get_evaluate_fn(model, x_test, y_test, dataset_names, dataset_rows, run_generalization):
     n = len(y_test)
     y_true = y_test.astype(bool)
     # Which dataset each test row came from (the test sets are concatenated
@@ -319,6 +383,9 @@ def get_evaluate_fn(model, x_test, y_test, dataset_names, dataset_rows):
             index=False,
         )
 
+        if run_generalization and server_round == NUM_ROUNDS:
+            evaluate_generalization(model, server_round)
+
         return loss, {**global_metrics, "elapsed_sec": elapsed}
 
     return evaluate
@@ -374,9 +441,19 @@ def round_config(server_round):
     return {"server_round": server_round, "num_rounds": NUM_ROUNDS}
 
 
+# Checked now rather than after the last round: building the generalization
+# cache needs ~1.3 GB of raw data that the Jetson does not have.
+run_generalization = common_cav.cached_split_path(
+    cantt_utils_cav.GEN_DATASET_KEY, cantt_utils_cav.BASE_DIR, TEST_SIZE, RANDOM_STATE) is not None
+if run_generalization:
+    print(f"[CACHE] {cantt_utils_cav.GEN_DATASET_KEY}: found, generalization sets will be evaluated after round {NUM_ROUNDS}", flush=True)
+else:
+    print(f"[CACHE] {cantt_utils_cav.GEN_DATASET_KEY}: NOT found, generalization evaluation will be SKIPPED "
+          f"(copy Pi4/split_cache/{cantt_utils_cav.GEN_DATASET_KEY}_*.npz to enable it)", flush=True)
+
 model = build_model((x_test.shape[1], x_test.shape[2]))
 strategy = LoggingFedAvg(
-    evaluate_fn=get_evaluate_fn(model, x_test, y_test, dataset_names, dataset_rows),
+    evaluate_fn=get_evaluate_fn(model, x_test, y_test, dataset_names, dataset_rows, run_generalization),
     on_fit_config_fn=round_config,
     on_evaluate_config_fn=round_config,
     min_fit_clients=len(DATASET_MODULES),

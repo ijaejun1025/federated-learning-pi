@@ -9,18 +9,18 @@ import flwr as fl
 import numpy as np
 from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score
 
-import ciciov_utils_cav as dataset
+import cantt_utils_cav as dataset
 from model_cav import BatchSequence, ProgressLog, build_model, format_duration, progress_callbacks
 
 TEST_SIZE = 0.33
 RANDOM_STATE = 41
 LOCAL_VAL_SIZE = 0.2
 PROGRESS_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "progress_log.txt")
-CLIENT_NAME = "Pi4-ciciov"
+CLIENT_NAME = "Pi4-cantt"
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--client-id", type=int, default=3, help="Log label only (CIC IoV 2024 client = Pi4)")
+parser.add_argument("--client-id", type=int, default=3, help="Log label only (can-train-and-test client = Pi4)")
 parser.add_argument("--server-address", type=str, default="192.168.137.250:3040")
 args = parser.parse_args()
 

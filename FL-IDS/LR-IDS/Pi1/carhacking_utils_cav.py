@@ -7,12 +7,32 @@ Raw data is auto-downloaded from HCRL's Dropbox share. Each of the four
 capture files (DoS, Fuzzy, gear, RPM) is time-ordered and contains both
 normal and injected frames, labeled by the trailing R/T flag.
 
-Split: each file is cut into 10 contiguous time blocks. Blocks 2, 5 and 8
-are test; the rest are train (see ``common_cav.split_time_blocks``). A
-the full blocks are used for test; each client trains on a random 15%
-of the training pool (see CLIENT_TRAIN_FRACTION). Rows with missing fields (corrupt lines) are dropped.
+Rows are ``timestamp, CAN ID, DLC, <DLC data bytes>, R/T``, so a frame with
+DLC < 8 is a shorter row; its missing data bytes are zero-padded. Only rows
+whose field count doesn't match their DLC are dropped (none in the
+published files).
+
+Shared tail: every capture file is an attack session (300 injections of
+3-5 s), then a time gap (22 s to 2.2 h), then the same 891,068 attack-free
+frames (482 s, byte-identical in all four files). Used as is, that one
+recording would be in the data four times and land in train for some files
+and in test for others. So each file contributes only its attack session,
+and the shared tail is used once, as its own attack-free capture. The tail
+is checked against its known size, time span and hash.
+
+``normal_run_data.txt`` (attack-free driving of the same car on another
+day, shipped as ``normal_run_data.7z``) only feeds the ID period table (see
+``common_cav``); it never becomes train or test rows. All 27 of its IDs
+occur in the attack captures, with matching periods (median ratio 1.00).
+
+Split: each attack session and the shared tail are cut into 10 contiguous
+time blocks. Blocks 2, 5 and 8 are test; the rest are train (see
+``common_cav.time_block_layout``). The full blocks are used for test; each
+client trains on a random 15% of the training pool (see
+CLIENT_TRAIN_FRACTION).
 """
 
+import hashlib
 import os
 import shutil
 import urllib.request
@@ -25,7 +45,11 @@ import common_cav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CAV_DIR = os.path.join(BASE_DIR, "Car-Hacking Dataset")
-DATASET_KEY = "carhacking_full"
+# New key whenever the rows, labels or features change: caches are found by
+# key alone (see common_cav.find_any_cached_split), so an old one would be reused.
+DATASET_KEY = "carhacking_h12t"
+NORMAL_RUN_FILE = os.path.join("normal_run_data", "normal_run_data.txt")
+SAMPLING = common_cav.RowSampling()
 DROPBOX_CAV_ZIP_URL = (
     "https://www.dropbox.com/scl/fo/9rwsf9pclhvv9xxloojom/AF7JeRW893grZkigkulkAHk"
     "?rlkey=3h6zamu3kc262lrnipu5qden8&dl=1"
@@ -38,6 +62,10 @@ REQUIRED_CAV_FILES = [
 ]
 # Fraction of the training pool each client trains on (test split is never sampled).
 CLIENT_TRAIN_FRACTION = 0.15
+# The attack-free recording appended to every capture file (see docstring).
+SHARED_TAIL_ROWS = 891_068
+SHARED_TAIL_SPAN = (1478200727.41947, 1478201209.058944)
+SHARED_TAIL_SHA256 = "fcf24225a5a6287f2eccc2cb70d31837c9d0269921df19f9acb9b3ba222828b8"
 
 reshape_for_cnn = common_cav.reshape_for_cnn
 
@@ -96,34 +124,84 @@ def _ensure_raw_cav_files() -> None:
         )
 
 
-def _capture_arrays(path: str):
-    """Parse one time-ordered capture into (features, labels) in file order."""
-    df = pd.read_csv(path, header=None, names=range(12), low_memory=False).dropna()
-    dlc = df[2].astype(np.int64).to_numpy()
-    data = np.column_stack(
-        [df[c].map(lambda s: int(str(s), 16)).to_numpy(dtype=np.int64) for c in range(3, 11)]
+def _capture_frames(path: str) -> common_cav.Frames:
+    """Parse one time-ordered capture.
+
+    The R/T flag is the row's last field, right after its DLC data bytes.
+    Reading every row as 12 columns and dropping rows with empty cells would
+    throw away every frame with DLC < 8 (about 1.2% of the rows, all normal).
+    """
+    df = pd.read_csv(path, header=None, names=range(12), dtype=str, low_memory=False)
+    n_fields = df.notna().sum(axis=1).to_numpy()
+    dlc = pd.to_numeric(df[2], errors="coerce").to_numpy()
+    well_formed = ~np.isnan(dlc) & (dlc <= common_cav.NUM_DATA_BYTES) & (n_fields == dlc + 4)
+    raw = df.to_numpy()[well_formed]
+    del df
+    n_fields = n_fields[well_formed]
+    dlc = dlc[well_formed].astype(np.int64)
+
+    data = np.zeros((len(raw), common_cav.NUM_DATA_BYTES), dtype=np.uint8)
+    for j in range(common_cav.NUM_DATA_BYTES):
+        has_byte = j < dlc
+        data[has_byte, j] = [int(s, 16) for s in raw[has_byte, 3 + j]]
+
+    flag = pd.Series(raw[np.arange(len(raw)), n_fields - 1])
+    y = (flag.str.strip().str.upper() == "T").to_numpy()
+    return common_cav.make_frames(
+        raw[:, 0].astype(np.float64), [int(s, 16) for s in raw[:, 1]], dlc, data, y,
     )
-    x = np.column_stack([dlc, data]).astype(np.float32)
-    y = (df[11].astype(str).str.strip().str.upper() == "T").to_numpy().astype(np.int64)
-    return x, y
 
 
-def _capture_split(path: str):
-    x, y = _capture_arrays(path)
-    train_idx, test_idx = common_cav.split_time_blocks(len(y))
-    return x[train_idx], y[train_idx], x[test_idx], y[test_idx]
+def _split_shared_tail(frames: common_cav.Frames, name: str):
+    """(attack session, shared tail) of one capture file; raises if the last
+    rows are not exactly the known shared tail."""
+    start = len(frames) - SHARED_TAIL_ROWS
+    tail = frames.rows(slice(start, None))
+    digest = hashlib.sha256()
+    for column in (tail.ts, tail.can_id, tail.dlc, tail.data, tail.y):
+        digest.update(np.ascontiguousarray(column).tobytes())
+    if (
+        start <= 0
+        or (float(tail.ts[0]), float(tail.ts[-1])) != SHARED_TAIL_SPAN
+        or frames.ts[start] - frames.ts[start - 1] <= common_cav.CAPTURE_GAP_S
+        or digest.hexdigest() != SHARED_TAIL_SHA256
+    ):
+        raise ValueError(f"{name}: its last {SHARED_TAIL_ROWS} frames are not the known shared attack-free tail")
+    return frames.rows(slice(0, start)), tail
 
 
-def _load_block_split(random_state: int):
-    parts = [
-        _capture_split(os.path.join(CAV_DIR, name))
-        for name in REQUIRED_CAV_FILES
-    ]
-    x_train = np.concatenate([p[0] for p in parts])
-    y_train = np.concatenate([p[1] for p in parts])
-    x_test = np.concatenate([p[2] for p in parts])
-    y_test = np.concatenate([p[3] for p in parts])
-    return x_train, x_test, y_train, y_test
+def _session_frames(name: str) -> common_cav.Frames:
+    return _split_shared_tail(_capture_frames(os.path.join(CAV_DIR, name)), name)[0]
+
+
+def _shared_tail_frames() -> common_cav.Frames:
+    name = REQUIRED_CAV_FILES[0]
+    return _split_shared_tail(_capture_frames(os.path.join(CAV_DIR, name)), name)[1]
+
+
+def _normal_run_frames(path: str) -> common_cav.Frames:
+    ts, can_id, dlc, data, rtr = common_cav.parse_hcrl_txt(path)
+    return common_cav.make_frames(ts, can_id, dlc, data, np.zeros(len(ts), dtype=np.int8), rtr=rtr)
+
+
+def _normal_run_path() -> str:
+    path = os.path.join(CAV_DIR, NORMAL_RUN_FILE)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"'{path}' is missing. It ships inside the dataset as "
+            f"normal_run_data.7z; extract it there (e.g. with 7-Zip)."
+        )
+    return path
+
+
+def _captures() -> list:
+    captures = [common_cav.Capture("normal_run_data", lambda: _normal_run_frames(_normal_run_path()),
+                                   split="baseline", attack_free=True)]
+    for name in REQUIRED_CAV_FILES:
+        captures.append(common_cav.Capture(f"{name} (attack session)", lambda name=name: _session_frames(name),
+                                           split="blocks"))
+    captures.append(common_cav.Capture("shared attack-free tail", _shared_tail_frames, split="blocks", attack_free=True))
+    return captures
 
 
 def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
@@ -135,12 +213,12 @@ def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41)
 
     _ensure_raw_cav_files()
     source_version = common_cav.directory_signature(
-        [os.path.join(CAV_DIR, name) for name in REQUIRED_CAV_FILES]
+        [os.path.join(CAV_DIR, name) for name in REQUIRED_CAV_FILES] + [_normal_run_path()]
     )
-    x_train, x_test, y_train, y_test = _load_block_split(random_state)
+    x_train, x_test, y_train, y_test, tables = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
     return common_cav.cache_precomputed_split(
         DATASET_KEY, BASE_DIR, x_train, x_test, y_train, y_test,
-        source_version, test_size, random_state,
+        source_version, test_size, random_state, common_cav.period_table_arrays(tables),
     )
 
 

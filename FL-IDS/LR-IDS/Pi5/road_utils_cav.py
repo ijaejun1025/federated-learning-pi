@@ -20,16 +20,42 @@ archive; every ``capture_metadata.json`` found anywhere under the folder is
 merged into one lookup, keyed by capture name = log filename without
 extension).
 
-Row-level labeling (confirmed against the real archive and its own
-readme.md): each attack capture's metadata entry carries an
-``injection_interval: [start, end]`` in seconds elapsed since that
-capture's own first frame -- rows inside that interval are labeled Attack,
-everything else Normal. ROAD's readme documents that the "accelerator
-attack" captures have ``injection_interval: null`` because no messages were
-actually injected (the capture just records the vehicle's anomalous
-behavior with no CAN-level ground truth to flag), so those are labeled
-entirely Normal, matching the paper's own convention. Only a capture with
-no metadata entry at all falls back to a coarse whole-file Attack label.
+Frame-level labeling: each attack capture's metadata entry gives the
+``injection_interval: [start, end]`` (seconds since the capture's first
+frame), the ``injection_id`` and the ``injection_data_str`` (hex, 'X' = a
+nibble left unaltered). A frame is Attack only if it is inside the interval,
+has the injected ID ("XXX" = any ID, the fuzzing captures) and its data
+matches the pattern. Labeling the whole interval instead marked ~96% normal
+frames (every other ID, and the genuine frames of the target ID) as attack.
+These labels match the authors' own per-frame labels in
+``signal_extractions/`` exactly for all 13 captures those cover. The
+interval check is needed: e.g. reverse_light_off's pattern also occurs in
+normal traffic outside the injection.
+
+The "accelerator attack" captures have ``injection_interval: null`` because
+no messages were injected (ROAD readme), so they are entirely Normal, as in
+the paper. The ``_masquerade`` variants (same capture with the conflicting
+genuine frames removed) are not used.
+
+The ambient captures' train blocks feed the ID period table (see
+``common_cav``). The accelerator captures are normal too, but they are not
+used for it: "no injected messages" is not the same as normal driving.
+
+ID 0xFFF frames are dropped. 0xFFF cannot be a standard (11-bit, max 0x7FF)
+CAN ID, it is not among the 105 messages of the dataset's own
+``anonymized.dbc``, and it looks like a logging/anonymization artifact:
+~6.3% of every capture, payload always zero, irregular spacing, often two at
+the same timestamp. Kept, these "normal" all-zero DLC-8 frames at short
+intervals would teach the shared model the opposite of the other clients'
+DoS frames (all-zero DLC-8 at 0.5 ms = attack). They are dropped after
+labeling, so injection intervals stay relative to each capture's first line.
+
+Labels follow the authors' intervals exactly; a handful of injected frames
+(1-7 per capture) fall just outside an interval and stay labeled normal, as
+in the authors' own signal_extractions labels.
+
+Split: each capture is cut into 10 contiguous time blocks; blocks 2, 5 and 8
+are test (see ``common_cav.time_block_layout``).
 """
 
 import glob
@@ -44,7 +70,12 @@ import common_cav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROAD_DIR = os.path.join(BASE_DIR, "ROAD Dataset")
-DATASET_KEY = "road_blk"
+# New key whenever the rows, labels or features change: caches are found by
+# key alone (see common_cav.find_any_cached_split), so an old one would be reused.
+DATASET_KEY = "road_inj_h12x"
+SAMPLING = common_cav.RowSampling()
+ARTIFACT_ID = 0xFFF            # see module docstring
+MAX_STANDARD_ID = 0x7FF
 # Fraction of the ~19M-row training pool this client actually trains on.
 # Sized so the client fits in a 1GB Raspberry Pi; the test split is unchanged.
 CLIENT_TRAIN_FRACTION = 0.10
@@ -123,51 +154,54 @@ def _load_all_capture_metadata() -> dict:
     return metadata
 
 
-def _capture_arrays(path: str, capture_metadata: dict):
-    """Features and labels for one capture, in time order."""
-    rows = common_cav.parse_candump_file(path)
-    x = np.asarray(
-        [common_cav.build_frame_features(dlc, data) for _, _, dlc, data in rows],
-        dtype=np.float32,
-    )
-    if _is_ambient(path):
-        y = np.zeros(len(rows), dtype=np.int64)
-        return x, y
-
-    capture_name = os.path.splitext(os.path.basename(path))[0]
-    entry = capture_metadata.get(capture_name)
-    interval = entry.get("injection_interval") if entry else None
-    if entry is None:
-        # No metadata entry at all: whole-file fallback.
-        y = np.ones(len(rows), dtype=np.int64)
-    elif interval is None:
-        # Metadata entry with null interval: accelerator-attack captures,
-        # which have no injected messages (ROAD readme).
-        y = np.zeros(len(rows), dtype=np.int64)
-    else:
-        t0 = rows[0][0] if rows else 0.0
-        t = np.array([r[0] - t0 for r in rows])
-        y = ((t >= interval[0]) & (t <= interval[1])).astype(np.int64)
-    return x, y
+def _capture_frames(path: str, capture_metadata: dict) -> common_cav.Frames:
+    """Frames and per-frame labels for one capture, in time order."""
+    ts, can_id, payload_hex, _ = common_cav.read_candump_log(path, with_label=False)
+    dlc, data = common_cav.hex_payloads(payload_hex)
+    y = np.zeros(len(ts), dtype=bool)
+    if not _is_ambient(path):
+        capture_name = os.path.splitext(os.path.basename(path))[0]
+        entry = capture_metadata.get(capture_name)
+        if entry is None:
+            raise ValueError(f"No capture_metadata.json entry for attack capture {capture_name!r}")
+        # Accelerator-attack captures have no interval: no injected messages (ROAD readme).
+        if entry.get("injection_interval") is not None:
+            y = _injected_frames(ts, can_id, payload_hex, entry)
+    # Drop the 0xFFF artifact frames (after labeling; see module docstring).
+    invalid = can_id > MAX_STANDARD_ID
+    if np.any(can_id[invalid] != ARTIFACT_ID):
+        raise ValueError(f"{path}: unexpected IDs above 0x7FF: {sorted(set(can_id[invalid].tolist()) - {ARTIFACT_ID})}")
+    if y[invalid].any():
+        raise ValueError(f"{path}: {int(y[invalid].sum())} attack-labeled 0xFFF frames")
+    keep = ~invalid
+    return common_cav.make_frames(ts[keep], can_id[keep], dlc[keep], data[keep], y[keep])
 
 
-def _load_block_split():
+def _injected_frames(ts, can_id, payload_hex, entry) -> np.ndarray:
+    """True for frames inside the injection interval whose ID and data match
+    the injected ones (see the module docstring)."""
+    start, end = entry["injection_interval"]
+    relative = ts - ts[0]
+    hit = (relative >= start) & (relative <= end)
+    target = entry["injection_id"]
+    if target != "XXX":
+        hit &= can_id == int(target, 16)
+    pattern = "^" + "".join("." if c == "X" else c for c in entry["injection_data_str"].upper()) + "$"
+    return hit & payload_hex.str.match(pattern).to_numpy()
+
+
+def _captures() -> list:
     capture_metadata = _load_all_capture_metadata()
     # Masquerade variants are near-copies of their original capture; keeping
     # both would let the same frames appear on both sides of the split.
     log_files = [p for p in _ensure_raw_files() if "_masquerade" not in os.path.basename(p)]
-
-    parts = []
-    for path in log_files:
-        x, y = _capture_arrays(path, capture_metadata)
-        train_idx, test_idx = common_cav.split_time_blocks(len(y))
-        parts.append((x[train_idx], y[train_idx], x[test_idx], y[test_idx]))
-
-    x_train = np.concatenate([p[0] for p in parts])
-    y_train = np.concatenate([p[1] for p in parts])
-    x_test = np.concatenate([p[2] for p in parts])
-    y_test = np.concatenate([p[3] for p in parts])
-    return x_train, x_test, y_train, y_test
+    return [
+        common_cav.Capture(
+            os.path.basename(path), lambda path=path: _capture_frames(path, capture_metadata),
+            split="blocks", attack_free=_is_ambient(path),
+        )
+        for path in log_files
+    ]
 
 
 def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
@@ -180,10 +214,10 @@ def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41)
 
     log_files = _ensure_raw_files()
     source_version = common_cav.directory_signature(log_files + _find_metadata_files())
-    x_train, x_test, y_train, y_test = _load_block_split()
+    x_train, x_test, y_train, y_test, tables = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
     return common_cav.cache_precomputed_split(
         DATASET_KEY, BASE_DIR, x_train, x_test, y_train, y_test,
-        source_version, test_size, random_state,
+        source_version, test_size, random_state, common_cav.period_table_arrays(tables),
     )
 
 

@@ -30,6 +30,29 @@ T=attack, confirmed present on every row of the Flooding/Fuzzy/Malfunction
 files) is always the last field. ``FreeDrivingData`` files carry no flag at
 all (verified empirically: field count is exactly 3 + DLC with nothing
 after the data bytes) because the whole file is normal driving.
+
+Each vehicle has its own ID period table, built from the train blocks of
+its ``FreeDrivingData`` capture (see ``common_cav``): the three cars use
+different IDs.
+
+Label fixes (frames sent by the attacker are attacks, frames sent by an ECU
+are normal, as in the Car-Hacking dataset); only these two, each checked to
+hit exactly the expected frames:
+
+- ``Fuzzy_dataset_Spark``: the 88 frames right after the last T frame are
+  labeled R but are injections: they start 1 ms after it, keep the fuzzer's
+  0.78 ms rhythm for 80 ms, and each uses a random ID that occurs nowhere
+  else. The labeled window simply ended 80 ms early. -> attack.
+- ``Fuzzy_dataset_SONATA``: 15 T frames are ``0x6AA 12 00 00 00 00`` with
+  DLC 5, while the fuzzer always sends DLC 8; it is the ECU reply that the
+  Car-Hacking Fuzzy capture labels R. -> normal.
+
+Other doubtful frames (reply-shaped T frames in the KIA/Sonata Fuzzy
+captures, ~55) are left as labeled: only payload shape or timing thresholds
+would identify them, and those rules disagree with each other.
+
+Split: each capture is cut into 10 contiguous time blocks; blocks 2, 5 and 8
+are test (see ``common_cav.time_block_layout``).
 """
 
 import glob
@@ -43,7 +66,16 @@ import common_cav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SURVIVAL_DIR = os.path.join(BASE_DIR, "Survival Analysis Dataset")
-DATASET_KEY = "survival_blk"
+# New key whenever the rows, labels or features change: caches are found by
+# key alone (see common_cav.find_any_cached_split), so an old one would be reused.
+DATASET_KEY = "survival_h12f"
+SAMPLING = common_cav.RowSampling()
+# See "Label fixes" in the module docstring.
+SPARK_FUZZY_LATE_INJECTIONS = 88
+SPARK_LATE_WINDOW_S = 0.1
+SONATA_FUZZY_ECU_REPLIES = 15
+SONATA_ECU_REPLY_ID = 0x6AA
+FUZZER_DLC = 8
 SOURCE_URL = "https://ocslab.hksecurity.net/Datasets/survival-ids"
 DROPBOX_SURVIVAL_ZIP_URL = (
     "https://www.dropbox.com/scl/fo/mqsp1orzaqjwu61j69amr/ANiI9XBqJHH5kLDUbrjrFw4"
@@ -117,13 +149,12 @@ def _parse_survival_file(path: str):
     no R/T flag at all. Both are handled here by field count rather than by
     filename, since that's what actually distinguishes them.
     """
-    rows = []
+    ts, ids, dlcs, data, y = [], [], [], [], []
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             parts = line.strip().split(",")
             if len(parts) < 3:
                 continue
-            can_id = int(parts[1], 16)
             dlc = int(parts[2])
             rest = parts[3:]
 
@@ -134,29 +165,64 @@ def _parse_survival_file(path: str):
                 data_bytes = [int(b, 16) for b in rest[:dlc]]
                 flag = rest[dlc].strip().upper() if len(rest) > dlc else None
 
-            label = "ATTACK" if flag == "T" else "Normal"
-            rows.append((can_id, dlc, data_bytes, label))
-    return rows
+            data_bytes = data_bytes[:common_cav.NUM_DATA_BYTES]
+            ts.append(float(parts[0]))
+            ids.append(int(parts[1], 16))
+            dlcs.append(dlc)
+            data.append(data_bytes + [0] * (common_cav.NUM_DATA_BYTES - len(data_bytes)))
+            y.append(flag == "T")
+    return common_cav.make_frames(ts, ids, dlcs, np.array(data, dtype=np.uint8), y)
 
 
-def _file_split(path: str):
-    rows = _parse_survival_file(path)
-    x = np.asarray(
-        [common_cav.build_frame_features(dlc, data) for _, dlc, data, _ in rows],
-        dtype=np.float32,
-    )
-    y = np.asarray([common_cav.LABEL_TO_INT[label] for *_, label in rows], dtype=np.int64)
-    train_idx, test_idx = common_cav.split_time_blocks(len(y))
-    return x[train_idx], y[train_idx], x[test_idx], y[test_idx]
+def _vehicle(path: str) -> str:
+    """``Flooding_dataset_SONATA.txt`` -> ``SONATA``."""
+    return os.path.splitext(os.path.basename(path))[0].rsplit("_", 1)[-1].upper()
 
 
-def _load_block_split():
-    parts = [_file_split(path) for path in _ensure_raw_files()]
-    x_train = np.concatenate([p[0] for p in parts])
-    y_train = np.concatenate([p[1] for p in parts])
-    x_test = np.concatenate([p[2] for p in parts])
-    y_test = np.concatenate([p[3] for p in parts])
-    return x_train, x_test, y_train, y_test
+def _free_driving_path(vehicle: str) -> str:
+    matches = [p for p in _ensure_raw_files()
+               if _vehicle(p) == vehicle and os.path.basename(p).startswith("FreeDrivingData")]
+    if len(matches) != 1:
+        raise FileNotFoundError(f"expected one FreeDrivingData capture for {vehicle}, found {matches}")
+    return matches[0]
+
+
+def _fix_labels(path: str, frames: common_cav.Frames) -> common_cav.Frames:
+    """Apply the two label fixes (module docstring); raise if either no
+    longer hits exactly the expected frames."""
+    name = os.path.basename(path)
+    y = frames.y.copy()
+    if name == "Fuzzy_dataset_Spark.txt":
+        free_ids = np.unique(_parse_survival_file(_free_driving_path("SPARK")).can_id)
+        last_attack = frames.ts[y == 1].max()
+        hit = (y == 0) & (frames.ts > last_attack) & ~np.isin(frames.can_id, free_ids)
+        if int(hit.sum()) != SPARK_FUZZY_LATE_INJECTIONS or frames.ts[hit].max() - last_attack > SPARK_LATE_WINDOW_S:
+            raise ValueError(f"{name}: late-injection fix would change {int(hit.sum())} frames, "
+                             f"expected {SPARK_FUZZY_LATE_INJECTIONS} within {SPARK_LATE_WINDOW_S} s")
+        y[hit] = 1
+    elif name == "Fuzzy_dataset_SONATA.txt":
+        hit = (y == 1) & (frames.dlc != FUZZER_DLC)
+        if int(hit.sum()) != SONATA_FUZZY_ECU_REPLIES or set(frames.can_id[hit].tolist()) != {SONATA_ECU_REPLY_ID}:
+            raise ValueError(f"{name}: ECU-reply fix would change {int(hit.sum())} frames, "
+                             f"expected {SONATA_FUZZY_ECU_REPLIES} frames of ID {SONATA_ECU_REPLY_ID:#x}")
+        y[hit] = 0
+    else:
+        return frames
+    return common_cav.Frames(frames.ts, frames.can_id, frames.dlc, frames.data, y, frames.rtr)
+
+
+def _capture_frames(path: str) -> common_cav.Frames:
+    return _fix_labels(path, _parse_survival_file(path))
+
+
+def _captures() -> list:
+    return [
+        common_cav.Capture(
+            os.path.basename(path), lambda path=path: _capture_frames(path), split="blocks",
+            attack_free=os.path.basename(path).startswith("FreeDrivingData"), group=_vehicle(path),
+        )
+        for path in _ensure_raw_files()
+    ]
 
 
 def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
@@ -166,10 +232,10 @@ def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41)
 
     txt_files = _ensure_raw_files()
     source_version = common_cav.directory_signature(txt_files)
-    x_train, x_test, y_train, y_test = _load_block_split()
+    x_train, x_test, y_train, y_test, tables = common_cav.build_feature_split(_captures(), SAMPLING, random_state)
     return common_cav.cache_precomputed_split(
         DATASET_KEY, BASE_DIR, x_train, x_test, y_train, y_test,
-        source_version, test_size, random_state,
+        source_version, test_size, random_state, common_cav.period_table_arrays(tables),
     )
 
 
