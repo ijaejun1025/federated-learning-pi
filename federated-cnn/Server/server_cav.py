@@ -10,7 +10,7 @@ import sys
 import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LR_IDS_DIR = os.path.dirname(BASE_DIR)
+PROJECT_DIR = os.path.dirname(BASE_DIR)
 
 # Each dataset's utils module lives inside its own PiN/ folder (self-contained
 # so that folder alone can be copied onto that Raspberry Pi), a sibling of
@@ -20,7 +20,7 @@ LR_IDS_DIR = os.path.dirname(BASE_DIR)
 # ones actually used below, even though every PiN/ folder also carries its
 # own copy for standalone Pi use.
 for _pi_folder in ("Pi1", "Pi2", "Pi3", "Pi4", "Pi5", "Pi6"):
-    sys.path.append(os.path.join(LR_IDS_DIR, _pi_folder))
+    sys.path.append(os.path.join(PROJECT_DIR, _pi_folder))
 
 import canmirgu_utils_cav
 import cantt_utils_cav

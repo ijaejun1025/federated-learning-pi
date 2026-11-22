@@ -1,12 +1,14 @@
 # Final_Defense
 
-Federated learning experiments for intrusion detection, including CNN- and LR-based IDS variants.
+Federated learning for CAN-bus intrusion detection: a Conv1D CNN trained with
+Flower FedAvg on six Raspberry Pi clients, each holding a different real CAN
+dataset (non-IID), with a Jetson Xavier as the server.
 
-## LR-IDS CAV Data Split
+## Layout
 
-For the CAV-based LR-IDS flow:
-
-- [FL-IDS/LR-IDS/utils_cav.py](FL-IDS/LR-IDS/utils_cav.py) preprocesses the full CAV dataset and returns the full feature and label arrays.
-- [FL-IDS/LR-IDS/client_cav.py](FL-IDS/LR-IDS/client_cav.py) performs the train/test split on each client.
-- Each client uses the same test ratio, but because the split is randomized per client run, different Raspberry Pi clients can evaluate on different test subsets.
-- [FL-IDS/LR-IDS/server_cav.py](FL-IDS/LR-IDS/server_cav.py) keeps a separate server-side evaluation split for global model assessment.
+- [federated-cnn/](federated-cnn/) — the federated CNN IDS
+  - `Server/` — Flower server (`server_cav.py`), runs on the Jetson
+  - `Pi1/` … `Pi6/` — one self-contained client folder per Raspberry Pi
+    (client script, dataset loader, shared `common_cav.py` / `model_cav.py`)
+  - [DEPLOYMENT.md](federated-cnn/DEPLOYMENT.md) — datasets, features,
+    training settings, caches and how to run it

@@ -1,4 +1,4 @@
-# FL-IDS Deployment Guide (Jetson Xavier server + 6 Raspberry Pi clients)
+# Federated CNN IDS Deployment Guide (Jetson Xavier server + 6 Raspberry Pi clients)
 
 ## Topology
 
@@ -54,7 +54,7 @@ Replace `<JETSON_IP>` with the Jetson Xavier's actual LAN IP address. The client
 
 **On the Jetson Xavier (start this first — it waits for all 6 clients before training begins):**
 ```bash
-cd FL-IDS/LR-IDS/Server
+cd federated-cnn/Server
 python server_cav.py
 ```
 
@@ -62,27 +62,27 @@ python server_cav.py
 
 ```bash
 # Pi1 — Car-Hacking Dataset
-cd FL-IDS/LR-IDS/Pi1
+cd federated-cnn/Pi1
 python carhacking_client_cav.py --server-address <JETSON_IP>:3040
 
 # Pi2 — OTIDS
-cd FL-IDS/LR-IDS/Pi2
+cd federated-cnn/Pi2
 python otids_client_cav.py --server-address <JETSON_IP>:3040
 
 # Pi3 — Survival Analysis Dataset
-cd FL-IDS/LR-IDS/Pi3
+cd federated-cnn/Pi3
 python survival_client_cav.py --server-address <JETSON_IP>:3040
 
 # Pi4 — can-train-and-test (set_04)
-cd FL-IDS/LR-IDS/Pi4
+cd federated-cnn/Pi4
 python cantt_client_cav.py --server-address <JETSON_IP>:3040
 
 # Pi5 — ROAD Dataset
-cd FL-IDS/LR-IDS/Pi5
+cd federated-cnn/Pi5
 python road_client_cav.py --server-address <JETSON_IP>:3040
 
 # Pi6 — CAN-MIRGU
-cd FL-IDS/LR-IDS/Pi6
+cd federated-cnn/Pi6
 python canmirgu_client_cav.py --server-address <JETSON_IP>:3040
 ```
 
