@@ -24,6 +24,29 @@ BATCH_SIZE = 256
 LOCAL_EPOCHS = 1
 USE_CLASS_WEIGHTS = False
 
+# Client learning rate per round: Adam's 1e-3 in round 1, falling by the same
+# factor every round to 1e-4 in the last round. With a fixed rate the global
+# model kept moving between rounds (in the PC simulation the macro recall at
+# FPR 1e-3 still changed by 0.01-0.05 per round after round 7, ROAD by up to
+# 0.28), since each client keeps pulling it toward its own data; a falling
+# rate lets the average settle. The server sends the rate with every round
+# (``learning_rate`` in the fit config).
+LEARNING_RATE_START = 1e-3
+LEARNING_RATE_END = 1e-4
+
+
+def learning_rate(server_round: int, num_rounds: int) -> float:
+    """Geometric decay from ``LEARNING_RATE_START`` (round 1) to ``LEARNING_RATE_END`` (last round)."""
+    if num_rounds <= 1:
+        return LEARNING_RATE_START
+    step = (server_round - 1) / (num_rounds - 1)
+    return float(LEARNING_RATE_START * (LEARNING_RATE_END / LEARNING_RATE_START) ** step)
+
+
+def set_learning_rate(model, rate: float) -> None:
+    """Set the compiled optimizer's learning rate (Adam's moment estimates are kept)."""
+    model.optimizer.learning_rate = rate
+
 
 def class_weights(y):
     """Balanced class weights if ``USE_CLASS_WEIGHTS``, else None (every row counts the same)."""
@@ -46,7 +69,8 @@ def build_model(input_shape):
         keras.layers.Dense(32, activation="relu"),
         keras.layers.Dense(2, activation="softmax"),
     ])
-    model.compile("adam", "sparse_categorical_crossentropy", metrics=["sparse_categorical_accuracy"])
+    model.compile(keras.optimizers.Adam(LEARNING_RATE_START), "sparse_categorical_crossentropy",
+                  metrics=["sparse_categorical_accuracy"])
     return model
 
 

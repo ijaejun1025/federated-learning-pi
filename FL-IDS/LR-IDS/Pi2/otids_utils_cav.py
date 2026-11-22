@@ -40,9 +40,10 @@ import common_cav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OTIDS_DIR = os.path.join(BASE_DIR, "OTIDS Dataset")
-# New key whenever the rows, labels or features change: caches are found by
-# key alone (see common_cav.find_any_cached_split), so an old one would be reused.
-DATASET_KEY = "otids_dos_h12r_s1_fs"
+# Cache name (split_cache/<DATASET_KEY>.npz): dataset name + version. Bump the
+# version whenever the rows, labels, features or sampling change: a cache is
+# found by this key alone, so an old one would otherwise be reused.
+DATASET_KEY = "otids_v1"
 SAMPLING = common_cav.Sampling()
 SOURCE_URL = "https://ocslab.hksecurity.net/Dataset/CAN-intrusion-dataset"
 DROPBOX_OTIDS_ZIP_URL = (

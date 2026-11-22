@@ -14,7 +14,14 @@ Features (12 per frame, ``FEATURE_NAMES``):
 - ``DLC``, ``DATA0`` .. ``DATA7``: the frame itself (short frames zero-padded).
 - ``log_dt``: log10 of the time since the previous frame of the same stream.
 - ``log_dt_over_period``: log10 of that time divided by the stream's usual period.
-- ``bits_changed``: data bits that differ from the previous frame of the stream.
+- ``bits_rel``: data bits that differ from the previous frame of the stream,
+  relative to the stream's usual change: log2((bits + 1) / (mean_bits + 1)),
+  with ``mean_bits`` from the period table. 0 is a usual change for this ID;
+  negative is fewer bits than usual (e.g. a repeated payload on an ID whose
+  payload normally changes). The raw bit count meant opposite things on
+  different datasets: an unchanged payload is mostly an attack (DoS,
+  spoofing) in Car-Hacking, OTIDS, Survival and can-train-and-test, but
+  mostly normal in ROAD, where many IDs never change.
 
 A stream is a CAN ID plus a frame kind (``frame_streams``): data frame,
 remote frame (RTR bit set: a request without data), or the data frame that
@@ -32,14 +39,14 @@ No feature uses labels or test data:
   all, i.e. the recording stopped), so a train frame never looks at a test
   frame and vice versa. The first frame of a stream in such a segment has no
   previous frame (``FIRST_FRAME_DT``, 0 bits).
-- The period table comes only from the train part of attack-free captures (a
-  capture-level fact from the dataset documentation, not per-frame labels).
-  A stream missing from it gets the lower median period of the table's
-  streams of the same kind, which is the period of one real stream of that
-  kind, so "ID never seen in attack-free traffic" is not encoded.
+- The period table (each stream's period and mean bits changed) comes only
+  from the train part of attack-free captures (a capture-level fact from the
+  dataset documentation, not per-frame labels). A stream missing from it gets
+  the lower median period (and mean bits) of the table's streams of the same
+  kind, which is the value of one real stream of that kind, so "ID never seen
+  in attack-free traffic" is not encoded.
 """
 
-import glob
 import os
 import re
 import urllib.parse
@@ -57,7 +64,7 @@ LABEL_TO_INT = {"Normal": 0, "ATTACK": 1}
 NUM_DATA_BYTES = 8
 FEATURE_NAMES = (
     ["DLC"] + [f"DATA{i}" for i in range(NUM_DATA_BYTES)]
-    + ["log_dt", "log_dt_over_period", "bits_changed"]
+    + ["log_dt", "log_dt_over_period", "bits_rel"]
 )
 NUM_FEATURES = len(FEATURE_NAMES)
 
@@ -77,9 +84,9 @@ RATIO_RANGE = (1e-4, 1e3)
 # datasets, and ROAD's DLC is always 8, so its std is 0), and the one global
 # model would have to learn six input scales at once. The ranges are known:
 # DLC 0..8 and bytes 0..255 map to -1..1, log_dt (-6..0) to -4..2,
-# log_dt_over_period (-4..3) stays as it is, bits_changed 0..64 maps to 0..8.
+# log_dt_over_period (-4..3) stays as it is, bits_rel (-6..6) maps to -3..3.
 FEATURE_CENTER = np.array([4.0] + [127.5] * NUM_DATA_BYTES + [-2.0, 0.0, 0.0])
-FEATURE_SCALE = np.array([4.0] + [127.5] * NUM_DATA_BYTES + [1.0, 1.0, 8.0])
+FEATURE_SCALE = np.array([4.0] + [127.5] * NUM_DATA_BYTES + [1.0, 1.0, 2.0])
 
 TIME_BLOCKS = 10
 TEST_BLOCKS = (2, 5, 8)
@@ -366,21 +373,31 @@ def same_id_history(frames: Frames, segment: np.ndarray):
 
 @dataclass
 class PeriodTable:
-    """Median time between frames of each stream (``frame_streams``) in
-    attack-free traffic. A stream missing from the table gets
-    ``fallbacks[kind]`` for its frame kind."""
+    """Per stream (``frame_streams``) in attack-free traffic: the median time
+    between its frames and the mean number of data bits changed from its
+    previous frame. A stream missing from the table gets the fallback of its
+    frame kind (``fallbacks`` / ``bits_fallbacks``)."""
     ids: np.ndarray
     periods: np.ndarray
     fallbacks: np.ndarray
+    mean_bits: np.ndarray
+    bits_fallbacks: np.ndarray
 
     @property
     def fallback(self) -> float:
         return float(self.fallbacks[DATA_FRAME])
 
-    def lookup(self, stream: np.ndarray) -> np.ndarray:
+    def _find(self, stream: np.ndarray):
         pos = np.clip(np.searchsorted(self.ids, stream), 0, max(len(self.ids) - 1, 0))
-        found = self.ids[pos] == stream
+        return pos, self.ids[pos] == stream
+
+    def lookup(self, stream: np.ndarray) -> np.ndarray:
+        pos, found = self._find(stream)
         return np.where(found, self.periods[pos], self.fallbacks[stream % FRAME_KINDS])
+
+    def lookup_mean_bits(self, stream: np.ndarray) -> np.ndarray:
+        pos, found = self._find(stream)
+        return np.where(found, self.mean_bits[pos], self.bits_fallbacks[stream % FRAME_KINDS])
 
 
 def _lower_median(values: np.ndarray) -> float:
@@ -390,28 +407,35 @@ def _lower_median(values: np.ndarray) -> float:
 
 
 def _period_table(parts: list) -> PeriodTable:
+    """``parts``: (stream, dt, bits) of the attack-free train frames that have a previous frame."""
     ids = np.concatenate([p[0] for p in parts])
     dts = np.concatenate([p[1] for p in parts])
+    bits = np.concatenate([p[2] for p in parts]).astype(np.float64)
     if len(ids) == 0:
         raise ValueError("no attack-free train frames to build the ID period table from")
     medians = pd.Series(dts).groupby(ids).median()
     streams = medians.index.to_numpy(dtype=np.int64)
     periods = medians.to_numpy(dtype=np.float64)
+    _, inverse = np.unique(ids, return_inverse=True)  # same sorted streams as the groupby
+    mean_bits = np.bincount(inverse, weights=bits) / np.bincount(inverse)
     # Fallbacks come from streams of the same kind, so a missing data stream
     # looks like some real data stream (and not, say, like the remote-frame
     # streams, which a data frame never is).
     kinds = streams % FRAME_KINDS
     if not np.any(kinds == DATA_FRAME):
         raise ValueError("no data frames in the attack-free train frames")
-    data_fallback = _lower_median(periods[kinds == DATA_FRAME])
-    fallbacks = np.array([
-        _lower_median(periods[kinds == kind]) if np.any(kinds == kind) else data_fallback
-        for kind in range(FRAME_KINDS)
-    ])
-    return PeriodTable(ids=streams, periods=periods, fallbacks=fallbacks)
+
+    def per_kind(values):
+        data_fallback = _lower_median(values[kinds == DATA_FRAME])
+        return np.array([
+            _lower_median(values[kinds == kind]) if np.any(kinds == kind) else data_fallback
+            for kind in range(FRAME_KINDS)
+        ])
+    return PeriodTable(ids=streams, periods=periods, fallbacks=per_kind(periods),
+                       mean_bits=mean_bits, bits_fallbacks=per_kind(mean_bits))
 
 
-def _features(dlc, data, dt, bits, period):
+def _features(dlc, data, dt, bits, period, mean_bits):
     first = np.isnan(dt)
     dt = np.where(first, FIRST_FRAME_DT, dt)
     ratio = np.where(first, 1.0, np.maximum(dt, MIN_DT) / period)
@@ -419,7 +443,7 @@ def _features(dlc, data, dt, bits, period):
         dlc, data,
         np.log10(np.clip(dt, MIN_DT, FIRST_FRAME_DT)),
         np.log10(np.clip(ratio, *RATIO_RANGE)),
-        bits,
+        np.log2((bits.astype(np.float64) + 1.0) / (mean_bits + 1.0)),
     ]).astype(np.float32)
 
 
@@ -487,7 +511,7 @@ def build_feature_split(captures: Iterable[Capture], sampling: Sampling, random_
         if capture.attack_free:
             usable = (train | (capture.split == "baseline")) & ~np.isnan(dt)
             baseline_parts.setdefault(capture.group, []).append(
-                (stream[usable], dt[usable].astype(np.float32)))
+                (stream[usable], dt[usable].astype(np.float32), bits[usable]))
 
         attack = frames.y == 1
         pool = np.full(n, -1, dtype=np.int8)
@@ -536,7 +560,9 @@ def build_feature_split(captures: Iterable[Capture], sampling: Sampling, random_
     for part in kept:
         if not len(part["y"]):
             continue
-        x = _features(part["dlc"], part["data"], part["dt"], part["bits"], tables[part["group"]].lookup(part["stream"]))
+        table = tables[part["group"]]
+        x = _features(part["dlc"], part["data"], part["dt"], part["bits"],
+                      table.lookup(part["stream"]), table.lookup_mean_bits(part["stream"]))
         is_train = part["pool"] <= TRAIN_ATTACK
         x_train.append(x[is_train]); y_train.append(part["y"][is_train])
         x_test.append(x[~is_train]); y_test.append(part["y"][~is_train])
@@ -566,6 +592,8 @@ def period_table_arrays(tables: dict) -> dict:
         "period_fallback_group": np.array(groups, dtype=str),
         # one column per frame kind: data, remote, remote reply
         "period_fallback_seconds": np.stack([tables[g].fallbacks for g in groups]),
+        "period_mean_bits": np.concatenate([tables[g].mean_bits for g in groups]),
+        "period_fallback_mean_bits": np.stack([tables[g].bits_fallbacks for g in groups]),
         "feature_names": np.array(FEATURE_NAMES, dtype=str),
     }
 
@@ -583,6 +611,24 @@ def reshape_for_cnn(x: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------- caching
+# A cache is split_cache/<dataset_key>.npz, e.g. split_cache/road_v1.npz. The
+# key (dataset name + version) is the only thing that identifies it, so bump
+# the version (v1 -> v2) whenever the rows, labels, features or sampling
+# change; otherwise an old cache would be read as if it were current. The
+# test size, random state and raw-file signature it was built with are stored
+# inside (``cache_metadata``) and checked when it is found.
+
+
+def cache_file_path(dataset_key: str, base_dir: str) -> str:
+    return os.path.join(base_dir, "split_cache", f"{dataset_key}.npz")
+
+
+def cache_metadata(source_version: int, test_size: float, random_state: int) -> dict:
+    """Arrays stored in every cache: what it was built with."""
+    return {"cache_test_size": np.array(test_size), "cache_random_state": np.array(random_state),
+            "cache_source_version": np.array(str(source_version))}
+
+
 def cache_split(
     dataset_key: str,
     base_dir: str,
@@ -604,26 +650,21 @@ def cache_split(
     x_train = scale_features(split.x_train)
     x_test = scale_features(split.x_test)
 
-    cache_dir = os.path.join(base_dir, "split_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    cache_path = os.path.join(
-        cache_dir,
-        f"{dataset_key}_ts{test_size}_rs{random_state}_src{source_version}.npz",
-    )
+    cache_path = cache_file_path(dataset_key, base_dir)
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     np.savez(
         cache_path, x_train=x_train, y_train=split.y_train, x_test=x_test, y_test=split.y_test,
         w_test=split.w_test, test_capture=split.test_capture,
-        scaler_mean=FEATURE_CENTER, scaler_scale=FEATURE_SCALE, **(extra_arrays or {}),
+        scaler_mean=FEATURE_CENTER, scaler_scale=FEATURE_SCALE,
+        **cache_metadata(source_version, test_size, random_state), **(extra_arrays or {}),
     )
     return x_train, x_test, split.y_train, split.y_test
 
 
 def directory_signature(paths: Iterable[str]) -> int:
-    """Combine the mtimes of a set of files into one cache-key integer.
-
-    Used as the "source version" for split caching so a cache is invalidated
-    automatically if any of a dataset's underlying files change.
-    """
+    """Combine the mtimes of a set of files into one integer: the raw files'
+    "source version", stored inside each cache for reference (a cache is
+    found by its key alone, see ``cache_file_path``)."""
     total = 0
     for path in paths:
         if os.path.exists(path):
@@ -634,16 +675,21 @@ def directory_signature(paths: Iterable[str]) -> int:
 def cached_split_path(dataset_key: str, base_dir: str, test_size: float = 0.33, random_state: int = 41):
     """Path of the cached split for ``dataset_key``, or None.
 
-    The cache filename carries a ``source_version`` signature computed from
-    the raw files' mtimes; recomputing it would require the (often multi-GB)
-    raw dataset just to find the cache, which is pointless on a Pi or the
-    Jetson that only has ``split_cache/*.npz`` copied onto it. Any source
-    suffix matches -- so ``dataset_key`` must change whenever the rows,
-    labels, features or sampling change.
+    Found by the key alone: a Pi or the Jetson has only ``split_cache/*.npz``
+    copied onto it, not the (often multi-GB) raw files, so the cache cannot
+    be checked against them -- ``dataset_key`` must change whenever the rows,
+    labels, features or sampling change. A cache built with another test
+    size or random state is an error, not a silent mismatch.
     """
-    pattern = os.path.join(base_dir, "split_cache", f"{dataset_key}_ts{test_size}_rs{random_state}_src*.npz")
-    matches = sorted(glob.glob(pattern))
-    return matches[0] if matches else None
+    path = cache_file_path(dataset_key, base_dir)
+    if not os.path.exists(path):
+        return None
+    with np.load(path) as data:
+        built = (float(data["cache_test_size"]), int(data["cache_random_state"]))
+    if built != (float(test_size), int(random_state)):
+        raise ValueError(f"{path} was built with test_size, random_state = {built}, "
+                         f"not {(test_size, random_state)}: rebuild it or use another key")
+    return path
 
 
 def load_cached(dataset_key: str, base_dir: str, names, test_size: float = 0.33, random_state: int = 41):

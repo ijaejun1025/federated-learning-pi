@@ -33,8 +33,8 @@ features use.
 The attack-free and accessory captures in train_01 feed the ID period table
 (see ``common_cav``); the 48 IDs they share have identical periods.
 
-Generalization sets (``iter_generalization_sets``, separate cache
-``GEN_DATASET_KEY``): unseen attacks on this car and the 2011 Chevrolet
+Generalization sets (``iter_generalization_sets``, one cache each, see
+``GEN_DATASET_KEYS``): unseen attacks on this car and the 2011 Chevrolet
 Traverse, which no client trains on. The server evaluates them once after the
 last round; see the GEN_* constants for the files and the overlaps avoided.
 """
@@ -50,9 +50,10 @@ import common_cav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CANTT_DIR = os.path.join(BASE_DIR, "can-train-and-test")
-# New key whenever the rows, labels or features change: caches are found by
-# key alone (see common_cav.find_any_cached_split), so an old one would be reused.
-DATASET_KEY = "cantt04_h12_s1_fs"
+# Cache name (split_cache/<DATASET_KEY>.npz): dataset name + version. Bump the
+# version whenever the rows, labels, features or sampling change: a cache is
+# found by this key alone, so an old one would otherwise be reused.
+DATASET_KEY = "can_train_test_set04_v1"
 SAMPLING = common_cav.Sampling()
 SOURCE_URL = "https://bitbucket.org/brooke-lampe/can-train-and-test"
 API_FILE_URL = "https://api.bitbucket.org/2.0/repositories/brooke-lampe/can-train-and-test/src/master/{path}"
@@ -110,7 +111,13 @@ DOWNLOAD_ATTEMPTS = 5
 #   only set_02/train_01 attack-free-1/2: accessory-1/2 there are the base
 #   traffic of the test_02 accessory attack captures.
 # - test_03 double-1 is dropped: its base traffic is train_01 systematic-4.
-GEN_DATASET_KEY = "cantt04_gen_h12_s1_fs"
+# One cache per set (split_cache/<key>.npz, same versioning rule as
+# DATASET_KEY); a Traverse cache also holds the Traverse calibration rows.
+GEN_DATASET_KEYS = {
+    "forester_unknown_attack": "can_train_test_subaru_new_attacks_v1",
+    "traverse_known_attack": "can_train_test_traverse_known_attacks_v1",
+    "traverse_unknown_attack": "can_train_test_traverse_new_attacks_v1",
+}
 TRAVERSE_CAL_DIR = "set_02/train_01"
 FORESTER_UNKNOWN_DIR = "set_04/test_03_known_vehicle_unknown_attack"
 TRAVERSE_KNOWN_DIR = "set_04/test_02_unknown_vehicle_known_attack"
@@ -287,42 +294,44 @@ def _gen_captures(set_name: str) -> list:
     return captures
 
 
-def _build_generalization_cache(test_size: float, random_state: int) -> str:
-    all_files = dict(FILES)
-    all_files.update(TRAVERSE_CALIBRATION_FILES)
-    for files in GEN_FILES.values():
-        all_files.update(files)
-    source_version = common_cav.directory_signature(_ensure_raw_files(all_files))
+def _build_generalization_cache(set_name: str, test_size: float, random_state: int) -> str:
+    """Build and save the cache of one generalization set; returns its path.
 
-    arrays = {"set_names": np.array(list(GEN_FILES), dtype=str)}
+    Arrays: ``x_test`` / ``y_test`` / ``w_test`` (weights: test normals are
+    capped as for the main test sets), ``test_file`` (index into
+    ``test_file_names``, one capture = one attack type), the set's period
+    table, and for the Traverse ``x_calibration``: its attack-free recording,
+    used without labels to set a threshold for the new vehicle.
+    """
+    vehicle_files = FILES if GEN_SET_VEHICLE[set_name] == "forester" else TRAVERSE_CALIBRATION_FILES
+    source_version = common_cav.directory_signature(_ensure_raw_files({**vehicle_files, **GEN_FILES[set_name]}))
+    captures = _gen_captures(set_name)
     # Calibration rows ("train") are all kept; test normals are capped as for
     # the main test sets, with weights.
-    sampling = common_cav.Sampling(train_rows=None)
-    for set_name in GEN_FILES:
-        captures = _gen_captures(set_name)
-        split = common_cav.build_feature_split(captures, sampling, random_state)
-        x_cal, x_test, y_test, tables, test_capture = split.x_train, split.x_test, split.y_test, split.tables, split.test_capture
-        arrays[f"w_{set_name}"] = split.w_test
-        # Every vehicle gets the same fixed scaling as the training data.
-        if GEN_SET_VEHICLE[set_name] == "forester":
-            arrays[f"calibration_{set_name}"] = np.array("")
-        else:
-            arrays["x_traverse_calibration"] = common_cav.scale_features(x_cal)
-            arrays[f"calibration_{set_name}"] = np.array("traverse_calibration")
-        first_test = len(captures) - len(GEN_FILES[set_name])
-        arrays[f"x_{set_name}"] = common_cav.scale_features(x_test)
-        arrays[f"y_{set_name}"] = y_test.astype(np.int8)
-        arrays[f"file_{set_name}"] = (test_capture - first_test).astype(np.int16)
-        arrays[f"files_{set_name}"] = np.array([c.name.split("/", 1)[1] for c in captures[first_test:]], dtype=str)
-        for key, value in common_cav.period_table_arrays(tables).items():
-            arrays[f"{key}_{set_name}"] = value
-        del split, x_cal, x_test
-
-    cache_dir = os.path.join(BASE_DIR, "split_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    path = os.path.join(cache_dir, f"{GEN_DATASET_KEY}_ts{test_size}_rs{random_state}_src{source_version}.npz")
-    np.savez(path, **arrays)
+    split = common_cav.build_feature_split(captures, common_cav.Sampling(train_rows=None), random_state)
+    first_test = len(captures) - len(GEN_FILES[set_name])
+    # Every vehicle gets the same fixed scaling as the training data.
+    arrays = {
+        "x_test": common_cav.scale_features(split.x_test),
+        "y_test": split.y_test.astype(np.int8),
+        "w_test": split.w_test,
+        "test_file": (split.test_capture - first_test).astype(np.int16),
+        "test_file_names": np.array([c.name.split("/", 1)[1] for c in captures[first_test:]], dtype=str),
+        "scaler_mean": common_cav.FEATURE_CENTER, "scaler_scale": common_cav.FEATURE_SCALE,
+        **common_cav.period_table_arrays(split.tables),
+    }
+    if GEN_SET_VEHICLE[set_name] == "traverse":
+        arrays["x_calibration"] = common_cav.scale_features(split.x_train)
+    path = common_cav.cache_file_path(GEN_DATASET_KEYS[set_name], BASE_DIR)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savez(path, **common_cav.cache_metadata(source_version, test_size, random_state), **arrays)
     return path
+
+
+def generalization_cache_paths(test_size: float = 0.33, random_state: int = 41) -> dict:
+    """``{set name: cache path, or None if that cache is missing}``."""
+    return {name: common_cav.cached_split_path(key, BASE_DIR, test_size, random_state)
+            for name, key in GEN_DATASET_KEYS.items()}
 
 
 def iter_generalization_sets(test_size: float = 0.33, random_state: int = 41):
@@ -331,12 +340,10 @@ def iter_generalization_sets(test_size: float = 0.33, random_state: int = 41):
     ``weights`` is how many rows each row stands for (test normals are
     capped, see common_cav.Sampling); ``x_calibration`` is the new vehicle's
     scaled attack-free traffic for threshold calibration, or None for the
-    known vehicle."""
-    path = common_cav.cached_split_path(GEN_DATASET_KEY, BASE_DIR, test_size, random_state)
-    if path is None:
-        path = _build_generalization_cache(test_size, random_state)
-    with np.load(path) as data:
-        for name in data["set_names"].tolist():
-            calibration = str(data[f"calibration_{name}"])
-            yield (name, data[f"x_{name}"], data[f"y_{name}"], data[f"w_{name}"], data[f"file_{name}"],
-                   data[f"files_{name}"].tolist(), data[f"x_{calibration}"] if calibration else None)
+    known vehicle. A missing cache is built from the raw files."""
+    for name, path in generalization_cache_paths(test_size, random_state).items():
+        if path is None:
+            path = _build_generalization_cache(name, test_size, random_state)
+        with np.load(path) as data:
+            yield (name, data["x_test"], data["y_test"], data["w_test"], data["test_file"],
+                   data["test_file_names"].tolist(), data["x_calibration"] if "x_calibration" in data.files else None)

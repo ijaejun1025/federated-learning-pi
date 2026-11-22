@@ -10,8 +10,9 @@ import numpy as np
 from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score
 
 import road_utils_cav as dataset
-from model_cav import (BATCH_SIZE, LOCAL_EPOCHS, THRESHOLD_TARGET_FPR, BatchSequence, ProgressLog, build_model,
-                       class_weights, format_duration, progress_callbacks)
+from model_cav import (BATCH_SIZE, LEARNING_RATE_START, LOCAL_EPOCHS, THRESHOLD_TARGET_FPR, BatchSequence,
+                       ProgressLog, build_model, class_weights, format_duration, progress_callbacks,
+                       set_learning_rate)
 
 TEST_SIZE = 0.33
 RANDOM_STATE = 41
@@ -48,9 +49,13 @@ class FlowerClient(fl.client.NumPyClient):
         return model.get_weights()
 
     def fit(self, parameters, config):
-        progress.write(config, f"fit started ({len(x_train)} rows, batch {BATCH_SIZE}, {LOCAL_EPOCHS} epoch(s))")
+        # The server lowers the learning rate every round (model_cav.learning_rate).
+        rate = float(config.get("learning_rate", LEARNING_RATE_START))
+        progress.write(config, f"fit started ({len(x_train)} rows, batch {BATCH_SIZE}, {LOCAL_EPOCHS} epoch(s), "
+                               f"learning rate {rate:.2e})")
         fit_start = time.time()
         model.set_weights(parameters)
+        set_learning_rate(model, rate)
         history = model.fit(
             train_batches,
             epochs=LOCAL_EPOCHS,

@@ -77,9 +77,10 @@ import common_cav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CANMIRGU_DIR = os.path.join(BASE_DIR, "CAN-MIRGU")
-# Renamed whenever the rows, labels or features change: a cache is found by
-# this key alone, so an old cache would otherwise keep being used.
-DATASET_KEY = "canmirgu_h12r_s1_fs"
+# Cache name (split_cache/<DATASET_KEY>.npz): dataset name + version. Bump the
+# version whenever the rows, labels, features or sampling change: a cache is
+# found by this key alone, so an old one would otherwise be reused.
+DATASET_KEY = "can_mirgu_v1"
 BENIGN_TEST_DAYS = ("Day_2", "Day_4", "Day_6")
 REPEATED_ATTACK_RE = re.compile(r"_(\d+)$")  # Gear_shifter_attack_1, ...
 TEST_REPEAT = "1"

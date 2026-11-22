@@ -45,9 +45,10 @@ import common_cav
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CAV_DIR = os.path.join(BASE_DIR, "Car-Hacking Dataset")
-# New key whenever the rows, labels or features change: caches are found by
-# key alone (see common_cav.find_any_cached_split), so an old one would be reused.
-DATASET_KEY = "carhacking_h12t_s1_fs"
+# Cache name (split_cache/<DATASET_KEY>.npz): dataset name + version. Bump the
+# version whenever the rows, labels, features or sampling change: a cache is
+# found by this key alone, so an old one would otherwise be reused.
+DATASET_KEY = "car_hacking_v1"
 NORMAL_RUN_FILE = os.path.join("normal_run_data", "normal_run_data.txt")
 SAMPLING = common_cav.Sampling()
 DROPBOX_CAV_ZIP_URL = (

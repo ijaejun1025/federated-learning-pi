@@ -29,7 +29,7 @@ import common_cav
 import otids_utils_cav
 import road_utils_cav
 import survival_utils_cav
-from model_cav import THRESHOLD_TARGET_FPR, build_model, format_duration
+from model_cav import THRESHOLD_TARGET_FPR, build_model, format_duration, learning_rate
 
 # One local epoch per round (model_cav.LOCAL_EPOCHS), so more, shorter rounds:
 # in the PC simulation the macro recall flattened out after rounds 6-9.
@@ -45,7 +45,8 @@ DATASET_METRICS_CSV = os.path.join(BASE_DIR, "dataset_metrics.csv")
 FINAL_RESULTS_CSV = os.path.join(BASE_DIR, "final_results.csv")
 FINAL_DATASETS_CSV = os.path.join(BASE_DIR, "final_dataset_metrics.csv")
 GENERALIZATION_FILES_CSV = os.path.join(BASE_DIR, "generalization_files.csv")
-# Result labels of Pi4's generalization sets (cantt_utils_cav.GEN_FILES).
+# Result labels of Pi4's generalization sets (cantt_utils_cav.GEN_FILES; one
+# cache each, cantt_utils_cav.GEN_DATASET_KEYS).
 GENERALIZATION_RESULTS = {
     "forester_unknown_attack": "2_trained_vehicle_new_attacks",
     "traverse_known_attack": "3_new_vehicle_known_attacks",
@@ -387,12 +388,14 @@ class Evaluator:
         p_small[idx] = _predict_attack(self.model, self.x_test[idx])
         self._dataset_table(p_small, 0.5, "sanity", rows=SANITY_ROWS_PER_DATASET)
         if self.run_generalization:
-            with np.load(common_cav.cached_split_path(cantt_utils_cav.GEN_DATASET_KEY, cantt_utils_cav.BASE_DIR,
-                                                      TEST_SIZE, RANDOM_STATE)) as data:
-                missing = [f"{k}_{n}" for n in data["set_names"].tolist() for k in ("x", "y", "w", "file", "files")
-                           if f"{k}_{n}" not in data.files]
-            if missing:
-                raise RuntimeError(f"generalization cache lacks {missing}")
+            for name, path in cantt_utils_cav.generalization_cache_paths(TEST_SIZE, RANDOM_STATE).items():
+                needed = ["x_test", "y_test", "w_test", "test_file", "test_file_names"]
+                if cantt_utils_cav.GEN_SET_VEHICLE[name] == "traverse":
+                    needed.append("x_calibration")
+                with np.load(path) as data:
+                    missing = [k for k in needed if k not in data.files]
+                if missing:
+                    raise RuntimeError(f"generalization cache {path} lacks {missing}")
         log_progress(f"round 0: evaluation code checked on {len(idx)} rows in {format_duration(time.time() - t_start)} "
                      f"(full evaluation starts after round 1)")
 
@@ -485,9 +488,10 @@ def load_test_split(dataset_module):
 
 
 def round_config(server_round):
-    """Sent to every Pi with each fit/evaluate request, so its progress lines
-    can say which round they belong to."""
-    return {"server_round": server_round, "num_rounds": NUM_ROUNDS}
+    """Sent to every Pi with each fit/evaluate request: the round (for its
+    progress lines) and this round's client learning rate (model_cav.learning_rate)."""
+    return {"server_round": server_round, "num_rounds": NUM_ROUNDS,
+            "learning_rate": learning_rate(server_round, NUM_ROUNDS)}
 
 
 if __name__ == "__main__":
@@ -507,13 +511,15 @@ if __name__ == "__main__":
 
     # Checked now rather than after the last round: building the
     # generalization cache needs ~1.3 GB of raw data the Jetson does not have.
-    run_generalization = common_cav.cached_split_path(
-        cantt_utils_cav.GEN_DATASET_KEY, cantt_utils_cav.BASE_DIR, TEST_SIZE, RANDOM_STATE) is not None
+    gen_paths = cantt_utils_cav.generalization_cache_paths(TEST_SIZE, RANDOM_STATE)
+    for name, key in cantt_utils_cav.GEN_DATASET_KEYS.items():
+        print(f"[CACHE] {key}: {'found' if gen_paths[name] else 'NOT found'}", flush=True)
+    run_generalization = all(gen_paths.values())
     if run_generalization:
-        print(f"[CACHE] {cantt_utils_cav.GEN_DATASET_KEY}: found, results 2-4 will be evaluated after round {NUM_ROUNDS}", flush=True)
+        print(f"[CACHE] results 2-4 will be evaluated after round {NUM_ROUNDS}", flush=True)
     else:
-        print(f"[CACHE] {cantt_utils_cav.GEN_DATASET_KEY}: NOT found, results 2-4 will be SKIPPED "
-              f"(copy Pi4/split_cache/{cantt_utils_cav.GEN_DATASET_KEY}_*.npz to enable them)", flush=True)
+        missing = [f"Pi4/split_cache/{cantt_utils_cav.GEN_DATASET_KEYS[n]}.npz" for n, path in gen_paths.items() if path is None]
+        print(f"[CACHE] results 2-4 will be SKIPPED (copy {', '.join(missing)} to enable them)", flush=True)
 
     model = build_model((x_test.shape[1], x_test.shape[2]))
     evaluator = Evaluator(model, x_test, y_test, w_test, dataset_names, dataset_rows, run_generalization)
