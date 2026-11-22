@@ -95,6 +95,7 @@ All server metrics are weighted by the test rows' `w_test` (so they estimate the
 Every round (threshold 0.5, for monitoring):
 - `Server/dataset_metrics.csv` — one row per client test set.
 - `Server/round_metrics.csv` — `macro_avg` (mean over the six datasets, each counts the same) and `pooled_weighted` (all rows pooled; CAN-MIRGU's large normal share dominates).
+- `Server/weights/round_NN.weights.h5` — the global model after the round (~1.2 MB each), so other metrics or thresholds can be computed later without rerunning FL (`build_model((12, 1)).load_weights(path)`). A failed save is logged in `progress_log.txt` and does not stop the run.
 - Round 0 (the untrained model) only checks that the evaluation code runs, on 50,000 rows per dataset.
 
 After the last round, once the clients have reported their thresholds:

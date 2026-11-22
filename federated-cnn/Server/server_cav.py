@@ -55,6 +55,10 @@ GENERALIZATION_RESULTS = {
 # Round 0 evaluates the untrained initial model; only a quick check that the
 # evaluation code runs is done then, on this many rows per dataset.
 SANITY_ROWS_PER_DATASET = 50_000
+# The global model after every round (round_01.weights.h5, ...; ~1.2 MB each),
+# so other metrics or thresholds can be computed later without rerunning FL:
+# build_model(...).load_weights(path).
+WEIGHTS_DIR = os.path.join(BASE_DIR, "weights")
 CLIENT_METRICS_CSV = os.path.join(BASE_DIR, "client_metrics.csv")
 PROGRESS_LOG = os.path.join(BASE_DIR, "progress_log.txt")
 TEST_SIZE = 0.33
@@ -303,6 +307,17 @@ def _append_csv(path, table):
     table.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
 
 
+def save_round_weights(model, server_round):
+    """WEIGHTS_DIR/round_NN.weights.h5. A failed save is logged, not raised,
+    so it cannot stop a day-long run (the CSVs are still written)."""
+    path = os.path.join(WEIGHTS_DIR, f"round_{server_round:02d}.weights.h5")
+    try:
+        os.makedirs(WEIGHTS_DIR, exist_ok=True)
+        model.save_weights(path)
+    except Exception as exc:  # noqa: BLE001
+        log_progress(f"[ROUND {server_round}] could not save the global weights to {path}: {exc!r}")
+
+
 class Evaluator:
     """Server-side evaluation of the global model.
 
@@ -361,6 +376,7 @@ class Evaluator:
         if server_round == 0:
             self._sanity_check()
             return None
+        save_round_weights(self.model, server_round)
         t_start = time.time()
         p_attack = _predict_attack(self.model, self.x_test)
         table = self._dataset_table(p_attack, 0.5, "default_0.5")

@@ -11,3 +11,6 @@ build/
 *.npz
 *.ipynb
 **/normal_run_data.txt
+
+centralized/results/
+federated-cnn/Server/weights/
