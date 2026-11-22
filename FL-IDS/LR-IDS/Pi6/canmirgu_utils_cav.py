@@ -48,19 +48,28 @@ IDs, as attack; those frames match normal traffic in payload and timing,
 because the attack is the *absence* of one ECU's messages, which a model
 that classifies single frames cannot see.
 
-Split: benign captures by recording day, attack captures by file.
+Split: benign captures by recording day; attack captures as in ROAD (Pi5),
+so every attack type in test was also seen in training.
 - Benign: several files are consecutive parts of one recording, cut every
   10M lines (day1 file1->2->3, day1 file4->5, day2 file1->2 follow each other
   with no gap), so a per-file split would put the two halves of one drive in
   train and test. Whole days go to one side instead: ``BENIGN_TEST_DAYS``
   (Day_2, Day_4, Day_6, ~38% of the benign frames) are test, the rest train.
-- Attack: every 3rd real-attack capture is test. They are independent
-  recordings: no 16-frame sequence of one occurs in any other capture.
+- Attacks recorded more than once (``Gear_shifter_attack_1/2``,
+  ``Min_speedometer_attack_1/2/3``, ``Multiple_attacks_1/2``): recording 1
+  is test, the others train. Attack captures are independent recordings: no
+  16-frame sequence of one occurs in any other capture.
+- Attacks recorded once: 10 contiguous time blocks, blocks 2, 5 and 8 test
+  (see ``common_cav.time_block_layout``). Every such capture then has
+  attack frames on both sides except Fuzzing_valid_IDs_DoS (its injections
+  fall in train blocks only); DoS_attack and Fuzzing_valid_IDs cover that
+  attack in test.
 The benign train captures feed the ID period table.
 """
 
 import glob
 import os
+import re
 import urllib.request
 import zipfile
 
@@ -70,8 +79,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CANMIRGU_DIR = os.path.join(BASE_DIR, "CAN-MIRGU")
 # Renamed whenever the rows, labels or features change: a cache is found by
 # this key alone, so an old cache would otherwise keep being used.
-DATASET_KEY = "canmirgu_h12s_s1"
+DATASET_KEY = "canmirgu_h12r_s1_fs"
 BENIGN_TEST_DAYS = ("Day_2", "Day_4", "Day_6")
+REPEATED_ATTACK_RE = re.compile(r"_(\d+)$")  # Gear_shifter_attack_1, ...
+TEST_REPEAT = "1"
 UCI_ZIP_URL = "https://archive.ics.uci.edu/static/public/1035/can-mirgu.zip"
 SOURCE_URLS = (
     "https://archive.ics.uci.edu/dataset/1035/can-mirgu",
@@ -190,19 +201,42 @@ def _used_captures(files: list):
     return benign, real_attack
 
 
+def _attack_splits(attack: list) -> dict:
+    """Split of each attack capture: repeated attacks by recording, the
+    others by time blocks (see module docstring)."""
+    groups = {}
+    for path in attack:
+        name = os.path.splitext(os.path.basename(path))[0]
+        match = REPEATED_ATTACK_RE.search(name)
+        groups.setdefault(name[:match.start()] if match else name, []).append((path, match))
+    splits = {}
+    for stem, members in groups.items():
+        if len(members) == 1:
+            splits[members[0][0]] = "blocks"
+            continue
+        repeats = {match.group(1) if match else None for _, match in members}
+        if TEST_REPEAT not in repeats or None in repeats:
+            raise ValueError(f"repeated attack {stem!r} has recordings {sorted(map(str, repeats))}, "
+                             f"expected numbered ones including {TEST_REPEAT}")
+        for path, match in members:
+            splits[path] = "test" if match.group(1) == TEST_REPEAT else "train"
+    return splits
+
+
 def _captures() -> list:
-    """Benign captures split by recording day, attack captures every 3rd
-    file (see module docstring); no capture contributes to both sides."""
+    """Benign captures split by recording day, attack captures by recording
+    or time blocks (see module docstring)."""
     benign, attack = _used_captures(_ensure_raw_files())
     benign_test = {p for p in benign if any(day in _capture_folders(p) for day in BENIGN_TEST_DAYS)}
     days = {f for p in benign for f in _capture_folders(p) if f.startswith("Day_")}
     if not set(BENIGN_TEST_DAYS) <= days or not benign_test or len(benign_test) == len(benign):
         raise ValueError(f"benign day folders {sorted(days)} do not fit BENIGN_TEST_DAYS {BENIGN_TEST_DAYS}")
-    test_files = benign_test | set(attack[::3])
+    splits = {p: "test" if p in benign_test else "train" for p in benign}
+    splits.update(_attack_splits(attack))
     return [
         common_cav.Capture(
             os.path.basename(path), lambda path=path: _capture_frames(path),
-            split="test" if path in test_files else "train", attack_free=path in benign,
+            split=splits[path], attack_free=path in benign,
         )
         for path in benign + attack
     ]

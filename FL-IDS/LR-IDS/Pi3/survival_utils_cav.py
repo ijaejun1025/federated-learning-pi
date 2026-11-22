@@ -68,7 +68,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SURVIVAL_DIR = os.path.join(BASE_DIR, "Survival Analysis Dataset")
 # New key whenever the rows, labels or features change: caches are found by
 # key alone (see common_cav.find_any_cached_split), so an old one would be reused.
-DATASET_KEY = "survival_h12f_s1"
+DATASET_KEY = "survival_h12f_s1_fs"
 SAMPLING = common_cav.Sampling()
 # See "Label fixes" in the module docstring.
 SPARK_FUZZY_LATE_INJECTIONS = 88

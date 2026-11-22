@@ -5,7 +5,7 @@
 - **Server**: NVIDIA Jetson Xavier, runs `Server/server_cav.py`, listens on port `3040`.
 - **Clients**: 6 separate Raspberry Pi boards, each runs exactly one `PiN/` folder. Copy only that one folder onto that specific Pi — every `PiN/` folder is self-contained (own `common_cav.py`/`model_cav.py` copies, own dataset).
 
-Every client trains a Conv1D CNN on the same 12-feature schema but on a **different real dataset** — this is a non-IID (heterogeneous-by-source) federated learning setup, not 6 shards of one dataset. Features per CAN frame (see `common_cav.py`): `DLC, DATA0..DATA7`, log time since the previous frame with the same CAN ID, that time divided by the ID's usual period (from the client's attack-free train captures), and the number of data bits changed since that previous frame. The CAN ID itself is not a feature.
+Every client trains a Conv1D CNN on the same 12-feature schema but on a **different real dataset** — this is a non-IID (heterogeneous-by-source) federated learning setup, not 6 shards of one dataset. Features per CAN frame (see `common_cav.py`): `DLC, DATA0..DATA7`, log time since the previous frame with the same CAN ID, that time divided by the ID's usual period (from the client's attack-free train captures), and the number of data bits changed since that previous frame. The CAN ID itself is not a feature. Every client, the server and the new-vehicle sets use the same fixed scaling (`common_cav.FEATURE_CENTER` / `FEATURE_SCALE`), not a scaler fit on each client's own data, so one frame becomes the same model input everywhere.
 
 ## How the server evaluates the model when every client's data is different
 
@@ -30,9 +30,11 @@ This is worth explaining since it's not obvious at first glance:
 
 Every dataset is labeled per frame (Pi1/Pi3: the dataset's R/T flag; Pi2: injected ID 0x000; Pi4/Pi6: the dataset's 0/1 column; Pi5: interval + ID + data pattern from the capture metadata). Pi1 also needs `normal_run_data.txt`, which ships zipped as `normal_run_data.7z` and must be extracted by hand (it only feeds the ID period table).
 
-Build the caches once on a PC with the raw data (`PiN/split_cache/*.npz`) and copy them with the code; a client or the server only falls back to the raw files (and their auto-download) when no cache with the current `DATASET_KEY` exists.
+Build the caches once on a PC with the raw data (`PiN/split_cache/*.npz`) and copy them with the code; a client or the server only falls back to the raw files (and their auto-download) when no cache with the current `DATASET_KEY` exists. Caches are found by key, so a cache with an old key is never read again: delete old `split_cache/*.npz` files from the Pis and the Jetson when the keys change (the current keys end in `_s1_fs`).
 
 Class balance (`common_cav.Sampling`): every client gets the same number of training rows (`TRAIN_ROWS_PER_CLIENT`, interim 600,000, including its local validation split), with all of its attack frames up to 20% of them and normal frames filling the rest; FedAvg weights clients by row count, so equal sizes keep any one dataset from dominating. Test sets keep every attack frame and at most 2,000,000 normal frames per dataset, uniformly sampled; each kept normal row carries a weight (`w_test`) so that weighted metrics estimate the full test set. Rows are sampled after the features are computed, so the time features always see every frame.
+
+Local training (`model_cav.py`): each round, every client trains `LOCAL_EPOCHS = 1` epoch at `BATCH_SIZE = 256` (about 1,875 steps on its 480,000 local training rows), without class weights (`USE_CLASS_WEIGHTS = False`; sampling already caps the attack share), and the server runs `NUM_ROUNDS = 15` rounds. Since every client's data comes from a different vehicle, long local training pulls the six models apart before they are averaged; in a PC simulation of this setup, batch 32 x 3 epochs per round collapsed by round 3, while this setting kept improving and levelled off after rounds 6-9.
 
 ## Commands to run
 
@@ -89,7 +91,7 @@ After the last round, once the clients have reported their thresholds:
 - `Server/generalization_files.csv` — results 2-4 per capture (= attack type).
 - Results 2-4 need `Pi4/split_cache/cantt04_gen_h12_s1_*.npz` on the Jetson; without it the server says so at startup and skips them.
 - `Server/client_metrics.csv` — each Pi's `local_val_*` numbers (training-like mix of 3-20% attacks, not comparable with the test metrics) and its proposed threshold.
-- 3 rounds run by default (`NUM_ROUNDS` in `server_cav.py`).
+- 15 rounds run by default (`NUM_ROUNDS` in `server_cav.py`).
 
 ## Requirements
 

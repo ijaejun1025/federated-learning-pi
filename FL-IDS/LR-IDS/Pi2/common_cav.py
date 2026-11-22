@@ -51,7 +51,6 @@ from typing import Callable, Iterable, Optional
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 
 LABEL_TO_INT = {"Normal": 0, "ATTACK": 1}
 
@@ -70,6 +69,17 @@ FIRST_FRAME_DT = 1.0
 CAPTURE_GAP_S = 1.0
 MIN_DT = 1e-6
 RATIO_RANGE = (1e-4, 1e3)
+
+# Fixed scaling, the same on every client, the server and a new vehicle:
+# scaled = (feature - FEATURE_CENTER) / FEATURE_SCALE. A scaler fit on each
+# client's own rows would turn the same frame into different inputs on
+# different clients (e.g. log_dt_over_period's spread differs ~9x between
+# datasets, and ROAD's DLC is always 8, so its std is 0), and the one global
+# model would have to learn six input scales at once. The ranges are known:
+# DLC 0..8 and bytes 0..255 map to -1..1, log_dt (-6..0) to -4..2,
+# log_dt_over_period (-4..3) stays as it is, bits_changed 0..64 maps to 0..8.
+FEATURE_CENTER = np.array([4.0] + [127.5] * NUM_DATA_BYTES + [-2.0, 0.0, 0.0])
+FEATURE_SCALE = np.array([4.0] + [127.5] * NUM_DATA_BYTES + [1.0, 1.0, 8.0])
 
 TIME_BLOCKS = 10
 TEST_BLOCKS = (2, 5, 8)
@@ -560,6 +570,11 @@ def period_table_arrays(tables: dict) -> dict:
     }
 
 
+def scale_features(x: np.ndarray) -> np.ndarray:
+    """The fixed scaling (``FEATURE_CENTER`` / ``FEATURE_SCALE``)."""
+    return ((x - FEATURE_CENTER) / FEATURE_SCALE).astype(np.float32)
+
+
 def reshape_for_cnn(x: np.ndarray) -> np.ndarray:
     if x.ndim == 2:
         # Conv1D expects (samples, timesteps, channels)
@@ -577,17 +592,17 @@ def cache_split(
     random_state: int = 41,
     extra_arrays: dict = None,
 ):
-    """Scale ``split`` with a scaler fit on its train rows only and cache it.
+    """Scale ``split`` with the fixed scaling (``scale_features``) and cache it.
 
     The file holds the client's training rows (``x_train``/``y_train``,
     already sampled to its final size) and the server's test rows with
-    their weights (``x_test``/``y_test``/``w_test``). ``extra_arrays``
-    (e.g. the ID period tables) are stored alongside for reference.
-    Returns ``(x_train, x_test, y_train, y_test)`` scaled.
+    their weights (``x_test``/``y_test``/``w_test``). ``scaler_mean`` /
+    ``scaler_scale`` are the fixed scaling's center and scale (raw = x *
+    scale + mean). ``extra_arrays`` (e.g. the ID period tables) are stored
+    alongside for reference. Returns ``(x_train, x_test, y_train, y_test)`` scaled.
     """
-    scaler = StandardScaler().fit(split.x_train)
-    x_train = scaler.transform(split.x_train).astype(np.float32)
-    x_test = scaler.transform(split.x_test).astype(np.float32)
+    x_train = scale_features(split.x_train)
+    x_test = scale_features(split.x_test)
 
     cache_dir = os.path.join(base_dir, "split_cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -598,7 +613,7 @@ def cache_split(
     np.savez(
         cache_path, x_train=x_train, y_train=split.y_train, x_test=x_test, y_test=split.y_test,
         w_test=split.w_test, test_capture=split.test_capture,
-        scaler_mean=scaler.mean_, scaler_scale=scaler.scale_, **(extra_arrays or {}),
+        scaler_mean=FEATURE_CENTER, scaler_scale=FEATURE_SCALE, **(extra_arrays or {}),
     )
     return x_train, x_test, split.y_train, split.y_test
 

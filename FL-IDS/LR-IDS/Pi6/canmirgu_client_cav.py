@@ -10,7 +10,8 @@ import numpy as np
 from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score
 
 import canmirgu_utils_cav as dataset
-from model_cav import THRESHOLD_TARGET_FPR, BatchSequence, ProgressLog, build_model, format_duration, progress_callbacks
+from model_cav import (BATCH_SIZE, LOCAL_EPOCHS, THRESHOLD_TARGET_FPR, BatchSequence, ProgressLog, build_model,
+                       class_weights, format_duration, progress_callbacks)
 
 TEST_SIZE = 0.33
 RANDOM_STATE = 41
@@ -33,14 +34,11 @@ x_train, x_val, y_train, y_val = dataset.get_client_data(
 x_train = dataset.reshape_for_cnn(x_train)
 x_val = dataset.reshape_for_cnn(x_val)
 
-# Compute per-class weights to counter class imbalance
-_counts = np.bincount(y_train)
-class_weight = {i: len(y_train) / (len(_counts) * c) for i, c in enumerate(_counts)}
-
 model = build_model((x_train.shape[1], x_train.shape[2]))
 model.summary()
 
-train_batches = BatchSequence(x_train, y_train, shuffle=True, class_weight=class_weight)
+# class_weights() is None unless model_cav.USE_CLASS_WEIGHTS (sampling already caps the attack share).
+train_batches = BatchSequence(x_train, y_train, shuffle=True, class_weight=class_weights(y_train))
 val_batches = BatchSequence(x_val, y_val)
 progress = ProgressLog(CLIENT_NAME, PROGRESS_LOG)
 
@@ -50,12 +48,12 @@ class FlowerClient(fl.client.NumPyClient):
         return model.get_weights()
 
     def fit(self, parameters, config):
-        progress.write(config, f"fit started ({len(x_train)} rows)")
+        progress.write(config, f"fit started ({len(x_train)} rows, batch {BATCH_SIZE}, {LOCAL_EPOCHS} epoch(s))")
         fit_start = time.time()
         model.set_weights(parameters)
         history = model.fit(
             train_batches,
-            epochs=3,
+            epochs=LOCAL_EPOCHS,
             validation_data=val_batches,
             verbose=1,
             callbacks=progress_callbacks(progress, config),

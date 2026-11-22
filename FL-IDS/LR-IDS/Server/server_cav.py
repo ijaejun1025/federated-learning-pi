@@ -31,7 +31,9 @@ import road_utils_cav
 import survival_utils_cav
 from model_cav import THRESHOLD_TARGET_FPR, build_model, format_duration
 
-NUM_ROUNDS = 3
+# One local epoch per round (model_cav.LOCAL_EPOCHS), so more, shorter rounds:
+# in the PC simulation the macro recall flattened out after rounds 6-9.
+NUM_ROUNDS = 15
 # Every round (threshold 0.5, progress monitoring): one row per dataset in
 # DATASET_METRICS_CSV, and the macro average / weighted pool in
 # ROUND_METRICS_CSV.

@@ -13,6 +13,25 @@ from tensorflow import keras
 # median of the six (only this number leaves a Pi, never its data).
 THRESHOLD_TARGET_FPR = 0.001
 
+# Local training per round. Each client's data is a different vehicle (non-IID),
+# so long local training pulls the six models apart before they are averaged
+# ("client drift"): batch 32 x 3 epochs (~45,000 steps per round) collapsed in
+# the PC simulation of this setup, while one epoch at batch 256 (~1,875 steps)
+# with more rounds kept improving. The attack share is already capped at 20%
+# by sampling, so rows are not reweighted by class (balanced weights gave
+# more false alarms at the low thresholds that matter here).
+BATCH_SIZE = 256
+LOCAL_EPOCHS = 1
+USE_CLASS_WEIGHTS = False
+
+
+def class_weights(y):
+    """Balanced class weights if ``USE_CLASS_WEIGHTS``, else None (every row counts the same)."""
+    if not USE_CLASS_WEIGHTS:
+        return None
+    counts = np.bincount(y)
+    return {i: len(y) / (len(counts) * c) for i, c in enumerate(counts)}
+
 
 def build_model(input_shape):
     model = keras.Sequential([
@@ -40,7 +59,7 @@ class BatchSequence(keras.utils.PyDataset):
     for array input.
     """
 
-    def __init__(self, x, y=None, batch_size=32, shuffle=False, class_weight=None):
+    def __init__(self, x, y=None, batch_size=BATCH_SIZE, shuffle=False, class_weight=None):
         super().__init__()
         self.x = x
         self.y = y

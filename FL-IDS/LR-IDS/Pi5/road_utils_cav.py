@@ -77,7 +77,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROAD_DIR = os.path.join(BASE_DIR, "ROAD Dataset")
 # New key whenever the rows, labels or features change: caches are found by
 # key alone (see common_cav.find_any_cached_split), so an old one would be reused.
-DATASET_KEY = "road_inj_h12x_s1"
+DATASET_KEY = "road_inj_h12x_s1_fs"
 SAMPLING = common_cav.Sampling()
 ARTIFACT_ID = 0xFFF            # see module docstring
 MAX_STANDARD_ID = 0x7FF

@@ -45,7 +45,6 @@ import urllib.request
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
 
 import common_cav
 
@@ -53,7 +52,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CANTT_DIR = os.path.join(BASE_DIR, "can-train-and-test")
 # New key whenever the rows, labels or features change: caches are found by
 # key alone (see common_cav.find_any_cached_split), so an old one would be reused.
-DATASET_KEY = "cantt04_h12_s1"
+DATASET_KEY = "cantt04_h12_s1_fs"
 SAMPLING = common_cav.Sampling()
 SOURCE_URL = "https://bitbucket.org/brooke-lampe/can-train-and-test"
 API_FILE_URL = "https://api.bitbucket.org/2.0/repositories/brooke-lampe/can-train-and-test/src/master/{path}"
@@ -107,11 +106,11 @@ DOWNLOAD_ATTEMPTS = 5
 # Attack captures in this dataset are a replayed attack-free log plus the
 # injected frames, so the same base traffic recurs across files. Two such
 # overlaps would leak and are avoided:
-# - Traverse calibration (period table, scaler, threshold calibration) uses
+# - Traverse calibration (period table, threshold calibration) uses
 #   only set_02/train_01 attack-free-1/2: accessory-1/2 there are the base
 #   traffic of the test_02 accessory attack captures.
 # - test_03 double-1 is dropped: its base traffic is train_01 systematic-4.
-GEN_DATASET_KEY = "cantt04_gen_h12_s1"
+GEN_DATASET_KEY = "cantt04_gen_h12_s1_fs"
 TRAVERSE_CAL_DIR = "set_02/train_01"
 FORESTER_UNKNOWN_DIR = "set_04/test_03_known_vehicle_unknown_attack"
 TRAVERSE_KNOWN_DIR = "set_04/test_02_unknown_vehicle_known_attack"
@@ -227,8 +226,9 @@ def _captures() -> list:
 
 
 def get_global_train_test_split(test_size: float = 0.33, random_state: int = 41):
-    """The dataset's own split (train_01 / test_01), scaled with a scaler fit
-    on train only and cached to split_cache/. ``test_size`` only names the cache."""
+    """The dataset's own split (train_01 / test_01), scaled with the fixed
+    scaling (common_cav.scale_features) and cached to split_cache/.
+    ``test_size`` only names the cache."""
     cached = common_cav.find_any_cached_split(DATASET_KEY, BASE_DIR, test_size, random_state)
     if cached is not None:
         return cached
@@ -265,7 +265,7 @@ def _gen_captures(set_name: str) -> list:
     Forester: train_01's attack-free/accessory captures as baseline only, so
     the period table is exactly the one the training data used. Traverse:
     its calibration captures as "train" rows (label-free normal traffic,
-    used for the period table, the scaler and threshold calibration).
+    used for the period table and threshold calibration).
     """
     captures = []
     if GEN_SET_VEHICLE[set_name] == "forester":
@@ -288,15 +288,6 @@ def _gen_captures(set_name: str) -> list:
 
 
 def _build_generalization_cache(test_size: float, random_state: int) -> str:
-    main_path = common_cav.cached_split_path(DATASET_KEY, BASE_DIR, test_size, random_state)
-    if main_path is None:
-        get_global_train_test_split(test_size, random_state)
-        main_path = common_cav.cached_split_path(DATASET_KEY, BASE_DIR, test_size, random_state)
-    with np.load(main_path) as main:
-        forester_scaler = StandardScaler()
-        forester_scaler.mean_, forester_scaler.scale_ = main["scaler_mean"], main["scaler_scale"]
-        forester_scaler.n_features_in_ = len(forester_scaler.mean_)
-
     all_files = dict(FILES)
     all_files.update(TRAVERSE_CALIBRATION_FILES)
     for files in GEN_FILES.values():
@@ -312,16 +303,14 @@ def _build_generalization_cache(test_size: float, random_state: int) -> str:
         split = common_cav.build_feature_split(captures, sampling, random_state)
         x_cal, x_test, y_test, tables, test_capture = split.x_train, split.x_test, split.y_test, split.tables, split.test_capture
         arrays[f"w_{set_name}"] = split.w_test
+        # Every vehicle gets the same fixed scaling as the training data.
         if GEN_SET_VEHICLE[set_name] == "forester":
-            scaler = forester_scaler
             arrays[f"calibration_{set_name}"] = np.array("")
         else:
-            # A new vehicle is standardized with its own attack-free traffic.
-            scaler = StandardScaler().fit(x_cal)
-            arrays["x_traverse_calibration"] = scaler.transform(x_cal).astype(np.float32)
+            arrays["x_traverse_calibration"] = common_cav.scale_features(x_cal)
             arrays[f"calibration_{set_name}"] = np.array("traverse_calibration")
         first_test = len(captures) - len(GEN_FILES[set_name])
-        arrays[f"x_{set_name}"] = scaler.transform(x_test).astype(np.float32)
+        arrays[f"x_{set_name}"] = common_cav.scale_features(x_test)
         arrays[f"y_{set_name}"] = y_test.astype(np.int8)
         arrays[f"file_{set_name}"] = (test_capture - first_test).astype(np.int16)
         arrays[f"files_{set_name}"] = np.array([c.name.split("/", 1)[1] for c in captures[first_test:]], dtype=str)
