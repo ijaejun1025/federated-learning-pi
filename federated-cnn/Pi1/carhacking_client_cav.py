@@ -10,6 +10,7 @@ import numpy as np
 from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score
 
 import carhacking_utils_cav as dataset
+import hardware_cav
 from model_cav import (BATCH_SIZE, LEARNING_RATE_START, LOCAL_EPOCHS, THRESHOLD_TARGET_FPR, BatchSequence,
                        ProgressLog, build_model, class_weights, format_duration, progress_callbacks,
                        set_learning_rate)
@@ -23,7 +24,7 @@ CLIENT_NAME = "Pi1-carhacking"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--client-id", type=int, default=0, help="Log label only (Car-Hacking client = Pi1)")
-parser.add_argument("--server-address", type=str, default="192.168.137.250:3040")
+parser.add_argument("--server-address", type=str, required=True, help="the Jetson server, e.g. <JETSON_IP>:3040")
 args = parser.parse_args()
 
 x_train, x_val, y_train, y_val = dataset.get_client_data(
@@ -42,6 +43,7 @@ model.summary()
 train_batches = BatchSequence(x_train, y_train, shuffle=True, class_weight=class_weights(y_train))
 val_batches = BatchSequence(x_val, y_val)
 progress = ProgressLog(CLIENT_NAME, PROGRESS_LOG)
+DEVICE_INFO = hardware_cav.device_info()
 
 
 class FlowerClient(fl.client.NumPyClient):
@@ -54,6 +56,7 @@ class FlowerClient(fl.client.NumPyClient):
         progress.write(config, f"fit started ({len(x_train)} rows, batch {BATCH_SIZE}, {LOCAL_EPOCHS} epoch(s), "
                                f"learning rate {rate:.2e})")
         fit_start = time.time()
+        meter = hardware_cav.HardwareMeter()
         model.set_weights(parameters)
         set_learning_rate(model, rate)
         history = model.fit(
@@ -65,15 +68,24 @@ class FlowerClient(fl.client.NumPyClient):
         )
         print("Fit history:", history.history)
         fit_seconds = time.time() - fit_start
+        weights = model.get_weights()
+        # Hardware use of this round's local training (hardware_cav; the server
+        # writes it to hardware_metrics.csv).
+        hardware = meter.stop(rows=len(x_train) * LOCAL_EPOCHS, received_bytes=hardware_cav.array_bytes(parameters),
+                              sent_bytes=hardware_cav.array_bytes(weights))
+        hardware.update(DEVICE_INFO)
         progress.write(config, f"fit done in {format_duration(fit_seconds)}; sending weights, then waiting for the other Pis")
-        return model.get_weights(), len(x_train), {"client_name": CLIENT_NAME, "fit_seconds": fit_seconds}
+        return weights, len(x_train), {"client_name": CLIENT_NAME, "fit_seconds": fit_seconds, **hardware}
 
     def evaluate(self, parameters, config):
         progress.write(config, "local evaluate started")
+        meter = hardware_cav.HardwareMeter()
         model.set_weights(parameters)
         loss, accuracy = model.evaluate(val_batches, verbose=0)
 
+        predict_start = time.time()
         y_pred_proba = model.predict(BatchSequence(x_val), verbose=0)
+        predict_seconds = time.time() - predict_start
         y_pred = y_pred_proba.argmax(axis=1)
         p_attack = y_pred_proba[:, 1]
 
@@ -85,6 +97,11 @@ class FlowerClient(fl.client.NumPyClient):
         map_score = average_precision_score(y_val, p_attack)
         # This client's proposed decision threshold (see THRESHOLD_TARGET_FPR).
         threshold = float(np.quantile(p_attack[y_val == 0], 1 - THRESHOLD_TARGET_FPR))
+        # Hardware use of this evaluation, then (not counted in it) the
+        # latency of one frame at a time.
+        hardware = meter.stop(rows=len(x_val), received_bytes=hardware_cav.array_bytes(parameters),
+                              infer_batch_ms_per_row=1000.0 * predict_seconds / len(x_val))
+        hardware.update(hardware_cav.frame_latency_ms(model, x_val))
 
         print(
             f"Client {args.client_id} local val accuracy: {accuracy:.4f}, "
@@ -105,6 +122,7 @@ class FlowerClient(fl.client.NumPyClient):
             "local_val_detection_rate": float(recall),
             "local_val_attack_share": float(np.mean(y_val)),
             "threshold_at_target_fpr": threshold,
+            **hardware,
         }
 
 

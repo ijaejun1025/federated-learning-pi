@@ -26,6 +26,7 @@ import canmirgu_utils_cav
 import cantt_utils_cav
 import carhacking_utils_cav
 import common_cav
+import hardware_cav
 import otids_utils_cav
 import road_utils_cav
 import survival_utils_cav
@@ -34,17 +35,20 @@ from model_cav import THRESHOLD_TARGET_FPR, build_model, format_duration, learni
 # One local epoch per round (model_cav.LOCAL_EPOCHS), so more, shorter rounds:
 # in the PC simulation the macro recall flattened out after rounds 6-9.
 NUM_ROUNDS = 15
+# Everything a run writes (the CSVs, progress_log.txt, weights/). Move the
+# files away before the next run: the CSVs are appended to.
+RESULTS_DIR = os.path.join(BASE_DIR, "results")
 # Every round (threshold 0.5, progress monitoring): one row per dataset in
 # DATASET_METRICS_CSV, and the macro average / weighted pool in
 # ROUND_METRICS_CSV.
-ROUND_METRICS_CSV = os.path.join(BASE_DIR, "round_metrics.csv")
-DATASET_METRICS_CSV = os.path.join(BASE_DIR, "dataset_metrics.csv")
+ROUND_METRICS_CSV = os.path.join(RESULTS_DIR, "round_metrics.csv")
+DATASET_METRICS_CSV = os.path.join(RESULTS_DIR, "dataset_metrics.csv")
 # After the last round: the four final results (see evaluate_final), and the
 # per-capture breakdown of the generalization sets (one capture = one attack
 # type).
-FINAL_RESULTS_CSV = os.path.join(BASE_DIR, "final_results.csv")
-FINAL_DATASETS_CSV = os.path.join(BASE_DIR, "final_dataset_metrics.csv")
-GENERALIZATION_FILES_CSV = os.path.join(BASE_DIR, "generalization_files.csv")
+FINAL_RESULTS_CSV = os.path.join(RESULTS_DIR, "final_results.csv")
+FINAL_DATASETS_CSV = os.path.join(RESULTS_DIR, "final_dataset_metrics.csv")
+GENERALIZATION_FILES_CSV = os.path.join(RESULTS_DIR, "generalization_files.csv")
 # Result labels of Pi4's generalization sets (cantt_utils_cav.GEN_FILES; one
 # cache each, cantt_utils_cav.GEN_DATASET_KEYS).
 GENERALIZATION_RESULTS = {
@@ -58,9 +62,21 @@ SANITY_ROWS_PER_DATASET = 50_000
 # The global model after every round (round_01.weights.h5, ...; ~1.2 MB each),
 # so other metrics or thresholds can be computed later without rerunning FL:
 # build_model(...).load_weights(path).
-WEIGHTS_DIR = os.path.join(BASE_DIR, "weights")
-CLIENT_METRICS_CSV = os.path.join(BASE_DIR, "client_metrics.csv")
-PROGRESS_LOG = os.path.join(BASE_DIR, "progress_log.txt")
+WEIGHTS_DIR = os.path.join(RESULTS_DIR, "weights")
+CLIENT_METRICS_CSV = os.path.join(RESULTS_DIR, "client_metrics.csv")
+# Hardware use (hardware_cav): one row per Pi per phase (fit, evaluate) and
+# one server row per round. The columns are fixed, so a reading one machine
+# lacks is an empty cell, not a shifted column.
+HARDWARE_METRICS_CSV = os.path.join(RESULTS_DIR, "hardware_metrics.csv")
+HARDWARE_COLUMNS = [
+    "round", "node", "phase", "wall_seconds", "rows", "rows_per_sec", "cpu_seconds", "cpu_util_pct",
+    "peak_rss_mb", "rss_mb", "mem_available_mb", "swap_used_mb", "temp_start_c", "temp_max_c", "temp_end_c",
+    "cpu_freq_min_mhz", "cpu_freq_mean_mhz", "throttled", "received_bytes", "sent_bytes",
+    "infer_batch_ms_per_row", "infer_frame_ms_median", "infer_frame_ms_p95", "infer_frames",
+    "fit_phase_seconds", "aggregation_seconds", "server_eval_seconds", "evaluate_phase_seconds",
+    "device_model", "cpu_count", "mem_total_mb",
+]
+PROGRESS_LOG = os.path.join(RESULTS_DIR, "progress_log.txt")
 TEST_SIZE = 0.33
 RANDOM_STATE = 41
 # Longest observed client round (Pi2, ~6.4h fit) plus margin, so a dropped
@@ -98,13 +114,36 @@ def _record_client_metrics(server_round, client, eval_res) -> None:
         "num_examples": eval_res.num_examples,
         "loss": eval_res.loss,
     }
-    row.update({k: v for k, v in eval_res.metrics.items() if k != "client_name"})
+    row.update({k: v for k, v in eval_res.metrics.items() if k != "client_name" and not k.startswith("hw_")})
     pd.DataFrame([row]).to_csv(
         CLIENT_METRICS_CSV,
         mode="a",
         header=not os.path.exists(CLIENT_METRICS_CSV),
         index=False,
     )
+
+
+def _record_hardware(server_round, node, phase, metrics) -> None:
+    """One row of HARDWARE_METRICS_CSV from a result's ``hw_*`` metrics. A
+    failure is logged, not raised, so it cannot stop the run."""
+    try:
+        row = {"round": server_round, "node": node, "phase": phase}
+        row.update({k[3:]: v for k, v in metrics.items() if k.startswith("hw_")})
+        pd.DataFrame([row]).reindex(columns=HARDWARE_COLUMNS).to_csv(
+            HARDWARE_METRICS_CSV, mode="a", header=not os.path.exists(HARDWARE_METRICS_CSV), index=False)
+    except Exception as exc:  # noqa: BLE001
+        log_progress(f"[ROUND {server_round}] could not record hardware metrics of {node} {phase}: {exc!r}")
+
+
+def _hardware_summary(metrics) -> str:
+    """A few hardware readings for the progress log (empty if there are none)."""
+    parts = []
+    for key, label, fmt in (("hw_peak_rss_mb", "peak RSS", "{:.0f} MB"), ("hw_cpu_util_pct", "CPU", "{:.0f}%"),
+                            ("hw_temp_max_c", "max temp", "{:.1f} C"), ("hw_cpu_freq_min_mhz", "min clock", "{:.0f} MHz"),
+                            ("hw_throttled", "throttled", "{}"), ("hw_infer_frame_ms_median", "frame latency", "{:.2f} ms")):
+        if key in metrics:
+            parts.append(f"{label} {fmt.format(metrics[key])}")
+    return (", " + ", ".join(parts)) if parts else ""
 
 
 def _stop_if_any_failure(phase: str, server_round: int, failures) -> None:
@@ -135,27 +174,62 @@ class LoggingFedAvg(fl.server.strategy.FedAvg):
     def __init__(self, evaluator=None, **kwargs):
         super().__init__(**kwargs)
         self.evaluator = evaluator
+        self.round_meter = None  # the server's hardware over the whole round
+        self.times = {}
 
     def configure_fit(self, server_round, parameters, client_manager):
         log_progress(f"[ROUND {server_round}] fit round starting")
+        self.round_meter = hardware_cav.HardwareMeter()
+        self.times = {"fit_start": time.time()}
         return super().configure_fit(server_round, parameters, client_manager)
 
     def aggregate_fit(self, server_round, results, failures):
+        self.times["fit_phase_seconds"] = time.time() - self.times.get("fit_start", time.time())
         for client, fit_res in results:
             name = fit_res.metrics.get("client_name", client.cid)
             fit_seconds = fit_res.metrics.get("fit_seconds")
             fit_time = "" if fit_seconds is None else f", fit_time={format_duration(fit_seconds)}"
             log_progress(
                 f"[ROUND {server_round}] fit OK from {name} "
-                f"(num_examples={fit_res.num_examples}{fit_time})"
+                f"(num_examples={fit_res.num_examples}{fit_time}{_hardware_summary(fit_res.metrics)})"
             )
+            _record_hardware(server_round, name, "fit", fit_res.metrics)
         _stop_if_any_failure("fit", server_round, failures)
         log_progress(f"[ROUND {server_round}] fit round done: {len(results)} ok")
-        return super().aggregate_fit(server_round, results, failures)
+        t_start = time.time()
+        aggregated = super().aggregate_fit(server_round, results, failures)
+        self.times["aggregation_seconds"] = time.time() - t_start
+        return aggregated
 
     def configure_evaluate(self, server_round, parameters, client_manager):
         log_progress(f"[ROUND {server_round}] evaluate round starting")
+        self.times["evaluate_start"] = time.time()
         return super().configure_evaluate(server_round, parameters, client_manager)
+
+    def _record_server_round(self, server_round, num_clients):
+        """The server's row of HARDWARE_METRICS_CSV: the round's phases and,
+        as payload, the global model sent to every client twice (fit and
+        evaluate) and received from every client once (fit)."""
+        try:
+            extra = {
+                "fit_phase_seconds": self.times.get("fit_phase_seconds"),
+                "aggregation_seconds": self.times.get("aggregation_seconds"),
+                "server_eval_seconds": getattr(self.evaluator, "last_elapsed", None),
+                "evaluate_phase_seconds": (time.time() - self.times["evaluate_start"]
+                                           if "evaluate_start" in self.times else None),
+            }
+            model_bytes = hardware_cav.array_bytes(self.evaluator.model.get_weights()) if self.evaluator else None
+            if model_bytes is not None:
+                extra["sent_bytes"] = 2 * num_clients * model_bytes
+                extra["received_bytes"] = num_clients * model_bytes
+            if self.round_meter is not None:
+                metrics = self.round_meter.stop(**extra)
+            else:
+                metrics = hardware_cav._clean({f"hw_{k}": v for k, v in extra.items()})
+            metrics.update(SERVER_DEVICE_INFO)
+            _record_hardware(server_round, "server", "round", metrics)
+        except Exception as exc:  # noqa: BLE001
+            log_progress(f"[ROUND {server_round}] could not record the server's hardware metrics: {exc!r}")
 
     def aggregate_evaluate(self, server_round, results, failures):
         thresholds = {}
@@ -166,11 +240,13 @@ class LoggingFedAvg(fl.server.strategy.FedAvg):
                 f"(num_examples={eval_res.num_examples})"
             )
             _record_client_metrics(server_round, client, eval_res)
+            _record_hardware(server_round, name, "evaluate", eval_res.metrics)
             if "threshold_at_target_fpr" in eval_res.metrics:
                 thresholds[name] = float(eval_res.metrics["threshold_at_target_fpr"])
         _stop_if_any_failure("evaluate", server_round, failures)
         log_progress(f"[ROUND {server_round}] evaluate round done: {len(results)} ok")
         aggregated = super().aggregate_evaluate(server_round, results, failures)
+        self._record_server_round(server_round, len(results))
         # Flower evaluates centrally (evaluate_fn) before the clients, so the
         # thresholds the clients propose for this round's model arrive here.
         if self.evaluator is not None and server_round == NUM_ROUNDS:
@@ -190,6 +266,7 @@ DATASETS = [
     ("Pi6-canmirgu", canmirgu_utils_cav),      # CAN-MIRGU
 ]
 DATASET_MODULES = [module for _, module in DATASETS]
+SERVER_DEVICE_INFO = hardware_cav.device_info()
 
 
 # ------------------------------------------------------------------ metrics
@@ -344,6 +421,7 @@ class Evaluator:
         self.run_generalization = run_generalization
         self.last_round = None
         self.last_p = None
+        self.last_elapsed = None  # seconds of the last round's evaluation
 
     # ---- tables
     def _dataset_table(self, p_attack, threshold, rule, rows=None):
@@ -388,7 +466,7 @@ class Evaluator:
         summary = table[table.dataset.isin(["macro_avg", "pooled_weighted"])].rename(columns={"dataset": "aggregate"})
         summary["elapsed_sec"] = elapsed
         _append_csv(ROUND_METRICS_CSV, summary)
-        self.last_round, self.last_p = server_round, p_attack
+        self.last_round, self.last_p, self.last_elapsed = server_round, p_attack, elapsed
         pooled = table[table.dataset == "pooled_weighted"].iloc[0]
         macro = table[table.dataset == "macro_avg"].iloc[0]
         return float(pooled["loss"]), {f"macro_{k}": float(macro[k]) for k in
@@ -511,6 +589,10 @@ def round_config(server_round):
 
 
 if __name__ == "__main__":
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    if os.listdir(RESULTS_DIR):
+        print(f"[RESULTS] {RESULTS_DIR} is not empty: this run's rows are appended to the CSVs there "
+              f"(stop now and move them away to start clean)", flush=True)
     x_parts, y_parts, w_parts, dataset_names, dataset_rows = [], [], [], [], []
     for dataset_name, dataset_module in DATASETS:
         x_part, y_part, w_part = load_test_split(dataset_module)

@@ -3,7 +3,7 @@
 ## Topology
 
 - **Server**: NVIDIA Jetson Xavier, runs `Server/server_cav.py`, listens on port `3040`.
-- **Clients**: 6 separate Raspberry Pi boards, each runs exactly one `PiN/` folder. Copy only that one folder onto that specific Pi — every `PiN/` folder is self-contained (own `common_cav.py`/`model_cav.py` copies, own dataset).
+- **Clients**: 6 separate Raspberry Pi boards, each runs exactly one `PiN/` folder. Copy only that one folder onto that specific Pi — every `PiN/` folder is self-contained (own `common_cav.py`/`model_cav.py`/`hardware_cav.py` copies, own dataset).
 
 Every client trains a Conv1D CNN on the same 12-feature schema but on a **different real dataset** — this is a non-IID (heterogeneous-by-source) federated learning setup, not 6 shards of one dataset. Features per CAN frame (see `common_cav.py`): `DLC, DATA0..DATA7`, log time since the previous frame with the same CAN ID, that time divided by the ID's usual period (from the client's attack-free train captures), and the number of data bits changed since that previous frame relative to the ID's usual change (`bits_rel` = log2((bits + 1) / (mean bits + 1)), the mean also from the attack-free train captures). The raw bit count meant opposite things on different datasets (an unchanged payload is mostly an attack in Car-Hacking, OTIDS, Survival and can-train-and-test, but mostly normal in ROAD, where many IDs never change); relative to each ID it means the same everywhere, and in the PC simulation it raised the macro recall at FPR 1e-3 over the six test sets from 0.90 to 0.99 (ROAD from 0.61 to 0.99). The CAN ID itself is not a feature. Every client, the server and the new-vehicle sets use the same fixed scaling (`common_cav.FEATURE_CENTER` / `FEATURE_SCALE`), not a scaler fit on each client's own data, so one frame becomes the same model input everywhere.
 
@@ -14,7 +14,7 @@ This is worth explaining since it's not obvious at first glance:
 1. Every round, each of the 6 clients trains locally on its own dataset and sends back its updated model weights plus how many samples it trained on.
 2. The server (`FedAvg` strategy) combines those 6 weight sets into one **global model**, weighted by each client's sample count.
 3. The server then evaluates *that global model itself* — clients are never asked to self-report evaluation metrics used for the official round record. At startup, the server built one **combined test set** by concatenating each of the 6 datasets' own held-out test split (time blocks 2/5/8 of each capture, whole held-out files, or the dataset's own test set — see each `PiN/*_utils_cav.py` docstring and `get_test_split()`).
-4. So `round_metrics.csv` (written in `Server/`) reports how well the *single shared global model* performs across **all 6 vehicles/attack types at once**; `dataset_metrics.csv` adds the same metrics per dataset. A model that overfits to just one client's data would score poorly here even if that one client's local training loss looked great — that's the actual point of this design: it measures whether federated averaging produced a model that generalizes across genuinely different CAN-bus sources, not just memorized one.
+4. So `round_metrics.csv` (written in `Server/results/`) reports how well the *single shared global model* performs across **all 6 vehicles/attack types at once**; `dataset_metrics.csv` adds the same metrics per dataset. A model that overfits to just one client's data would score poorly here even if that one client's local training loss looked great — that's the actual point of this design: it measures whether federated averaging produced a model that generalizes across genuinely different CAN-bus sources, not just memorized one.
 5. `min_fit_clients = min_evaluate_clients = min_available_clients = 6` is set explicitly, so a round only proceeds once **all 6** clients are connected — losing one client (e.g. it crashes or the dataset isn't downloaded) stalls the round rather than silently degrading to a partial average.
 
 ## Per-client dataset reference
@@ -50,7 +50,7 @@ Local training (`model_cav.py`): each round, every client trains `LOCAL_EPOCHS =
 
 ## Commands to run
 
-Replace `<JETSON_IP>` with the Jetson Xavier's actual LAN IP address. The client scripts default to `192.168.137.250:3040` (a common USB-tether/ICS subnet address) — if that's not the Jetson's real address on your network, pass `--server-address` explicitly as shown.
+Replace `<JETSON_IP>` with the Jetson Xavier's actual LAN IP address and pass it with `--server-address` as shown.
 
 **On the Jetson Xavier (start this first — it waits for all 6 clients before training begins):**
 ```bash
@@ -93,18 +93,32 @@ Each Pi also accepts `--client-id <n>` purely as a log label (defaults are alrea
 All server metrics are weighted by the test rows' `w_test` (so they estimate the full test sets), and precision / F1 are those of the attack class; `f1_weighted_avg` (sklearn's average="weighted", near 1 whenever normals dominate) is kept for comparison only. Columns: accuracy, precision, detection_rate, f1_score, fpr, fnr, roc_auc, pr_auc, mcc, f1_weighted_avg, loss, weighted counts (tn/fp/fn/tp, num_examples, attack_examples) and `sampled_rows`.
 
 Every round (threshold 0.5, for monitoring):
-- `Server/dataset_metrics.csv` — one row per client test set.
-- `Server/round_metrics.csv` — `macro_avg` (mean over the six datasets, each counts the same) and `pooled_weighted` (all rows pooled; CAN-MIRGU's large normal share dominates).
-- `Server/weights/round_NN.weights.h5` — the global model after the round (~1.2 MB each), so other metrics or thresholds can be computed later without rerunning FL (`build_model((12, 1)).load_weights(path)`). A failed save is logged in `progress_log.txt` and does not stop the run.
+- `Server/results/dataset_metrics.csv` — one row per client test set.
+- `Server/results/round_metrics.csv` — `macro_avg` (mean over the six datasets, each counts the same) and `pooled_weighted` (all rows pooled; CAN-MIRGU's large normal share dominates).
+- `Server/results/weights/round_NN.weights.h5` — the global model after the round (~1.2 MB each), so other metrics or thresholds can be computed later without rerunning FL (`build_model((12, 1)).load_weights(path)`). A failed save is logged in `Server/results/progress_log.txt` and does not stop the run.
 - Round 0 (the untrained model) only checks that the evaluation code runs, on 50,000 rows per dataset.
 
 After the last round, once the clients have reported their thresholds:
-- `Server/final_results.csv` — the four results: `1_all_client_test_sets` (macro_avg and pooled_weighted), `2_trained_vehicle_new_attacks` (Forester `test_03` without `double-1`), `3_new_vehicle_known_attacks` (2011 Chevrolet Traverse `test_02`), `4_new_vehicle_new_attacks` (Traverse `test_04`). Each at threshold 0.5 and at the median of the clients' proposed thresholds (`client_median_fpr_0.001`: the score each client's local validation normals exceed with probability 0.1%; only that number leaves a Pi). The Traverse sets also at `vehicle_calibrated_fpr_0.001`, set on the Traverse's own attack-free recording (no labels).
-- `Server/final_dataset_metrics.csv` — result 1 per dataset at both thresholds.
-- `Server/generalization_files.csv` — results 2-4 per capture (= attack type).
+- `Server/results/final_results.csv` — the four results: `1_all_client_test_sets` (macro_avg and pooled_weighted), `2_trained_vehicle_new_attacks` (Forester `test_03` without `double-1`), `3_new_vehicle_known_attacks` (2011 Chevrolet Traverse `test_02`), `4_new_vehicle_new_attacks` (Traverse `test_04`). Each at threshold 0.5 and at the median of the clients' proposed thresholds (`client_median_fpr_0.001`: the score each client's local validation normals exceed with probability 0.1%; only that number leaves a Pi). The Traverse sets also at `vehicle_calibrated_fpr_0.001`, set on the Traverse's own attack-free recording (no labels).
+- `Server/results/final_dataset_metrics.csv` — result 1 per dataset at both thresholds.
+- `Server/results/generalization_files.csv` — results 2-4 per capture (= attack type).
 - Results 2-4 need the three generalization caches in `Pi4/split_cache/` on the Jetson (`can_train_test_subaru_new_attacks_v1.npz`, `can_train_test_traverse_known_attacks_v1.npz`, `can_train_test_traverse_new_attacks_v1.npz`); the server prints `found` / `NOT found` for each at startup and skips results 2-4 unless all three are there.
-- `Server/client_metrics.csv` — each Pi's `local_val_*` numbers (training-like mix of 3-20% attacks, not comparable with the test metrics) and its proposed threshold.
+- `Server/results/client_metrics.csv` — each Pi's `local_val_*` numbers (training-like mix of 3-20% attacks, not comparable with the test metrics) and its proposed threshold.
 - 15 rounds run by default (`NUM_ROUNDS` in `server_cav.py`).
+- Everything the server writes goes to `Server/results/` (the CSVs, `progress_log.txt`, `weights/`). The CSVs are appended to, so move the folder away (e.g. to the PC) before the next run; the server warns at startup if it is not empty.
+
+### Hardware metrics
+
+`Server/results/hardware_metrics.csv` (from `hardware_cav.py`, standard library only, nothing to install): one row per Pi per phase (`fit`, `evaluate`) and one `server` row (`round`) per round, with fixed columns.
+
+- `wall_seconds`, `rows`, `rows_per_sec`, `cpu_seconds`, `cpu_util_pct` (CPU time / wall time / cores, all of the process's threads).
+- Memory: `peak_rss_mb` (the process's peak since it started), `rss_mb`, `mem_available_mb`, `swap_used_mb`, `mem_total_mb`.
+- `temp_start_c` / `temp_max_c` / `temp_end_c` and `cpu_freq_min_mhz` / `cpu_freq_mean_mhz`, sampled every 5 s; a clock below the Pi's maximum means it throttled. `throttled` is `vcgencmd get_throttled` (bits 0-3 now, 16-19 since boot: under-voltage, frequency capped, throttled, soft temperature limit).
+- Payload: `received_bytes` / `sent_bytes`, the raw weight arrays (~1.2 MB; Flower's message adds a few bytes per array). The server row counts the global model sent to every Pi twice (fit and evaluate) and received from every Pi once.
+- `evaluate` rows: `infer_batch_ms_per_row` (prediction of the local validation set at batch 256) and `infer_frame_ms_median` / `infer_frame_ms_p95` over 500 single frames (batch 1, measured after the evaluation, model only: the features are precomputed).
+- `server` row: `fit_phase_seconds` (the server sending the model until the last Pi's update; the slowest Pi plus communication), `aggregation_seconds`, `server_eval_seconds`, `evaluate_phase_seconds`.
+- A reading a machine lacks (temperature on a PC, `vcgencmd` on the Jetson) is an empty cell; a failed measurement never stops the run. Each `fit OK` line in `progress_log.txt` shows peak RSS, CPU, max temperature, min clock and throttling, so round 1 shows whether the Pis' readings work.
+- Power is not measured: a Raspberry Pi 3 has no power sensor (it needs an external USB meter).
 
 ## Requirements
 
